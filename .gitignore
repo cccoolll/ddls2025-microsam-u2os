@@ -1,0 +1,51 @@
+.cursorrules
+
+# Data directories
+data/
+*.png
+*.jpg
+*.jpeg
+*.json
+*.pkl
+*.h5
+*.hdf5
+
+# Model checkpoints
+models/
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+
+# Results and outputs
+results/
+outputs/
+logs/
+wandb/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Jupyter notebooks
+.ipynb_checkpoints/
+
+# Environment
+.env
+.venv
+env/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
