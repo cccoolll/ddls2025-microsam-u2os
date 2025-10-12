@@ -192,7 +192,9 @@ def finetune_revvity25_ais(args):
     print(f"   - Learning rate: {args.learning_rate}")
     print(f"   - Max iterations: {args.iterations}")
     
-    # Run training
+    # Run AIS training (Auto Instance Segmentation with UNETR decoder)
+    print("🤖 Starting AIS training with UNETR decoder...")
+    
     training_kwargs = {
         "name": checkpoint_name,
         "model_type": model_type,
@@ -213,7 +215,8 @@ def finetune_revvity25_ais(args):
     if args.save_every_kth_epoch is not None:
         training_kwargs["save_every_kth_epoch"] = args.save_every_kth_epoch
     
-    sam_training.train_sam(**training_kwargs)
+    # Use train_instance_segmentation for AIS training (includes UNETR decoder)
+    sam_training.train_instance_segmentation(**training_kwargs)
     
     # Export the trained model
     if args.export_path is not None:
