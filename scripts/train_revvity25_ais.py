@@ -37,12 +37,13 @@ class Revvity25Dataset(Dataset):
         self.transform = transform
         self.label_transform = label_transform
         
-        # Load split information
-        split_info_path = self.data_dir / "processed" / "split_info.json"
-        with open(split_info_path, 'r') as f:
-            split_info = json.load(f)
+        # Get list of processed image files
+        images_dir = self.data_dir / "processed" / "images"
+        if split == "train":
+            self.image_files = [f for f in os.listdir(images_dir) if f.startswith("train_") and f.endswith(".png")]
+        else:
+            self.image_files = [f for f in os.listdir(images_dir) if f.startswith("valid_") and f.endswith(".png")]
         
-        self.image_files = split_info[split]
         print(f"📊 Loaded {len(self.image_files)} {split} images")
         
     def __len__(self):
@@ -126,6 +127,7 @@ def get_dataloaders(data_dir, patch_shape=(512, 512), batch_size=2, num_workers=
         pin_memory=True,
         drop_last=True
     )
+    train_loader.shuffle = True  # Add shuffle attribute
     
     val_loader = DataLoader(
         val_dataset,
@@ -134,6 +136,7 @@ def get_dataloaders(data_dir, patch_shape=(512, 512), batch_size=2, num_workers=
         num_workers=num_workers,
         pin_memory=True
     )
+    val_loader.shuffle = False  # Add shuffle attribute
     
     return train_loader, val_loader
 
@@ -205,10 +208,6 @@ def finetune_revvity25_ais(args):
         save_root=args.save_root,
         scheduler_kwargs=scheduler_kwargs,
         save_every_kth_epoch=args.save_every_kth_epoch,
-        peft_kwargs={
-            "rank": args.lora_rank, 
-            "attention_layers_to_update": [9, 10, 11]
-        } if args.lora_rank is not None else None,
     )
     
     # Export the trained model

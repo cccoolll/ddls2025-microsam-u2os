@@ -17,7 +17,7 @@ from typing import Dict, List, Tuple, Any
 class Revvity25Preprocessor:
     """Preprocessor for Revvity-25 dataset."""
     
-    def __init__(self, data_dir: str = "data/revvity25", target_size: int = 512):
+    def __init__(self, data_dir: str = "data/Revvity-25", target_size: int = 512):
         """
         Initialize the preprocessor.
         
@@ -209,13 +209,144 @@ class Revvity25Preprocessor:
         print(f"✅ Processed {len(processed_data['images'])} images for {split}")
         return processed_data
     
-    def create_train_valid_split(self):
-        """Create train/validation split from processed data."""
-        print("\n📊 Creating train/validation split...")
+    def process_split_from_coco(self, coco_data, split_name):
+        """Process a specific split from COCO data."""
+        print(f"\n🔄 Processing {split_name} split from COCO data...")
         
-        # Process both splits
-        train_data = self.process_split('train')
-        valid_data = self.process_split('valid')
+        processed_data = {
+            'images': [],
+            'masks': [],
+            'metadata': []
+        }
+        
+        # Get images and annotations
+        images = coco_data.get('images', [])
+        annotations = coco_data.get('annotations', [])
+        
+        # Group annotations by image_id
+        annotations_by_image = {}
+        for ann in annotations:
+            image_id = ann['image_id']
+            if image_id not in annotations_by_image:
+                annotations_by_image[image_id] = []
+            annotations_by_image[image_id].append(ann)
+        
+        for i, image_info in enumerate(images):
+            image_id = image_info['id']
+            image_filename = image_info['file_name']
+            
+            # Get image path
+            image_path = self.data_dir / "images" / image_filename
+            
+            if not image_path.exists():
+                print(f"⚠️  Image not found: {image_path}")
+                continue
+            
+            # Load image
+            image = cv2.imread(str(image_path))
+            if image is None:
+                print(f"❌ Failed to load image: {image_path}")
+                continue
+            
+            # Convert BGR to RGB
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            original_shape = image.shape[:2]
+            
+            # Get annotations for this image
+            image_annotations = annotations_by_image.get(image_id, [])
+            
+            # Create segmentation mask from COCO annotations
+            mask = self.create_coco_segmentation_mask(original_shape, image_annotations)
+            
+            # Resize image and mask
+            resized_image, resized_mask = self.resize_image_and_mask(image, mask)
+            
+            # Normalize image
+            normalized_image = self.normalize_image(resized_image)
+            
+            # Save processed data
+            processed_image_path = self.processed_dir / "images" / f"{split_name}_{i:03d}.png"
+            processed_mask_path = self.processed_dir / "masks" / f"{split_name}_{i:03d}.png"
+            
+            # Save as PNG
+            cv2.imwrite(str(processed_image_path), (resized_image * 255).astype(np.uint8))
+            cv2.imwrite(str(processed_mask_path), resized_mask)
+            
+            # Store metadata
+            metadata = {
+                'image_id': image_id,
+                'filename': image_filename,
+                'original_shape': original_shape,
+                'target_shape': (self.target_size, self.target_size),
+                'num_cells': len(image_annotations),
+                'image_path': str(processed_image_path),
+                'mask_path': str(processed_mask_path)
+            }
+            
+            processed_data['images'].append(normalized_image)
+            processed_data['masks'].append(resized_mask)
+            processed_data['metadata'].append(metadata)
+            
+            print(f"  ✅ Processed {image_filename}: {len(image_annotations)} cells")
+        
+        print(f"✅ Processed {len(processed_data['images'])} images for {split_name}")
+        return processed_data
+    
+    def create_train_valid_split(self):
+        """Create train/validation split from processed data with 80/20 ratio."""
+        print("\n📊 Creating 80/20 train/validation split...")
+        
+        # Load all images and annotations
+        all_images = []
+        all_annotations = []
+        
+        # Load train data
+        train_coco = self.load_annotations('train')
+        if train_coco:
+            all_images.extend(train_coco.get('images', []))
+            all_annotations.extend(train_coco.get('annotations', []))
+        
+        # Load valid data
+        valid_coco = self.load_annotations('valid')
+        if valid_coco:
+            all_images.extend(valid_coco.get('images', []))
+            all_annotations.extend(valid_coco.get('annotations', []))
+        
+        print(f"📊 Total images: {len(all_images)}")
+        print(f"📊 Total annotations: {len(all_annotations)}")
+        
+        # Create 80/20 split
+        np.random.seed(42)  # For reproducibility
+        indices = np.random.permutation(len(all_images))
+        
+        # 80% for training, 20% for validation
+        train_size = int(0.8 * len(all_images))
+        train_indices = indices[:train_size]
+        valid_indices = indices[train_size:]
+        
+        print(f"📊 Train: {len(train_indices)} images (80%)")
+        print(f"📊 Valid: {len(valid_indices)} images (20%)")
+        
+        # Create new train/valid splits
+        train_images = [all_images[i] for i in train_indices]
+        valid_images = [all_images[i] for i in valid_indices]
+        
+        # Create new COCO format data
+        train_coco_new = {
+            'images': train_images,
+            'annotations': [ann for ann in all_annotations if ann['image_id'] in [img['id'] for img in train_images]],
+            'categories': train_coco.get('categories', []) if train_coco else []
+        }
+        
+        valid_coco_new = {
+            'images': valid_images,
+            'annotations': [ann for ann in all_annotations if ann['image_id'] in [img['id'] for img in valid_images]],
+            'categories': valid_coco.get('categories', []) if valid_coco else []
+        }
+        
+        # Process the new splits
+        train_data = self.process_split_from_coco(train_coco_new, 'train')
+        valid_data = self.process_split_from_coco(valid_coco_new, 'valid')
         
         # Save split information
         split_info = {
