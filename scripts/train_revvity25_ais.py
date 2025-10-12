@@ -209,14 +209,15 @@ def finetune_revvity25_ais(args):
         "n_iterations": args.iterations,
         "save_root": args.save_root,
         "scheduler_kwargs": scheduler_kwargs,
+        "with_segmentation_decoder": True,  # Enable AIS training with UNETR decoder
     }
     
     # Only add save_every_kth_epoch if it's not None
     if args.save_every_kth_epoch is not None:
         training_kwargs["save_every_kth_epoch"] = args.save_every_kth_epoch
     
-    # Use train_instance_segmentation for AIS training (includes UNETR decoder)
-    sam_training.train_instance_segmentation(**training_kwargs)
+    # Use train_sam with segmentation decoder for AIS training (includes UNETR decoder)
+    sam_training.train_sam(**training_kwargs)
     
     # Export the trained model
     if args.export_path is not None:
@@ -288,8 +289,8 @@ def main():
     parser.add_argument(
         "--n_objects", "-n",
         type=int,
-        default=25,
-        help="Number of objects per batch for training (default: 25)"
+        default=15,
+        help="Number of objects per batch for training (default: 15)"
     )
     
     parser.add_argument(
