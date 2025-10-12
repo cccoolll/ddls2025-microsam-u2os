@@ -193,22 +193,27 @@ def finetune_revvity25_ais(args):
     print(f"   - Max iterations: {args.iterations}")
     
     # Run training
-    sam_training.train_sam(
-        name=checkpoint_name,
-        model_type=model_type,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        early_stopping=10,
-        n_objects_per_batch=n_objects_per_batch,
-        checkpoint_path=checkpoint_path,
-        freeze=freeze_parts,
-        device=device,
-        lr=args.learning_rate,
-        n_iterations=args.iterations,
-        save_root=args.save_root,
-        scheduler_kwargs=scheduler_kwargs,
-        save_every_kth_epoch=args.save_every_kth_epoch,
-    )
+    training_kwargs = {
+        "name": checkpoint_name,
+        "model_type": model_type,
+        "train_loader": train_loader,
+        "val_loader": val_loader,
+        "early_stopping": 10,
+        "n_objects_per_batch": n_objects_per_batch,
+        "checkpoint_path": checkpoint_path,
+        "freeze": freeze_parts,
+        "device": device,
+        "lr": args.learning_rate,
+        "n_iterations": args.iterations,
+        "save_root": args.save_root,
+        "scheduler_kwargs": scheduler_kwargs,
+    }
+    
+    # Only add save_every_kth_epoch if it's not None
+    if args.save_every_kth_epoch is not None:
+        training_kwargs["save_every_kth_epoch"] = args.save_every_kth_epoch
+    
+    sam_training.train_sam(**training_kwargs)
     
     # Export the trained model
     if args.export_path is not None:
@@ -316,8 +321,8 @@ def main():
     parser.add_argument(
         "--save_every_kth_epoch", 
         type=int, 
-        default=5,
-        help="Save checkpoint every k epochs (default: 5)"
+        default=None,
+        help="Save checkpoint every k epochs (default: None, only save best and latest)"
     )
     
     args = parser.parse_args()
