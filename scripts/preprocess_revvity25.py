@@ -1,486 +1,142 @@
 #!/usr/bin/env python3
 """
-Data preprocessing pipeline for Revvity-25 dataset.
-Prepares the dataset for microSAM fine-tuning.
+Simple data preprocessing for Revvity-25 dataset following micro-sam tutorial pattern.
+Converts COCO format to simple image/mask pairs.
 """
 
 import os
 import json
 import numpy as np
 import cv2
-from PIL import Image
-import torch
 from pathlib import Path
 import matplotlib.pyplot as plt
-from typing import Dict, List, Tuple, Any
 
-class Revvity25Preprocessor:
-    """Preprocessor for Revvity-25 dataset."""
-    
-    def __init__(self, data_dir: str = "data/Revvity-25", target_size: int = 512):
-        """
-        Initialize the preprocessor.
-        
-        Args:
-            data_dir: Path to the dataset directory
-            target_size: Target image size for training (default: 512x512)
-        """
-        self.data_dir = Path(data_dir)
-        self.target_size = target_size
-        self.processed_dir = self.data_dir / "processed"
-        self.processed_dir.mkdir(exist_ok=True)
-        
-        # Create subdirectories
-        (self.processed_dir / "images").mkdir(exist_ok=True)
-        (self.processed_dir / "masks").mkdir(exist_ok=True)
-        (self.processed_dir / "train").mkdir(exist_ok=True)
-        (self.processed_dir / "valid").mkdir(exist_ok=True)
-        
-    def load_annotations(self, split: str) -> Dict:
-        """Load annotations for a specific split."""
-        ann_path = self.data_dir / "annotations" / f"{split}.json"
-        
-        if not ann_path.exists():
-            print(f"❌ Annotation file not found: {ann_path}")
-            return {}
-        
-        with open(ann_path, 'r') as f:
-            annotations = json.load(f)
-        
-        print(f"✅ Loaded COCO format annotations for {split}")
-        print(f"  Images: {len(annotations.get('images', []))}")
-        print(f"  Annotations: {len(annotations.get('annotations', []))}")
-        return annotations
-    
-    def create_segmentation_mask(self, image_shape: Tuple[int, int], 
-                                cells: List[Dict]) -> np.ndarray:
-        """
-        Create segmentation mask from cell annotations.
-        
-        Args:
-            image_shape: (height, width) of the image
-            cells: List of cell annotations with polygon coordinates
-            
-        Returns:
-            Segmentation mask with cell IDs
-        """
-        mask = np.zeros(image_shape, dtype=np.uint8)
-        
-        for cell_id, cell in enumerate(cells, 1):
-            if 'segmentation' in cell and 'polygon' in cell['segmentation']:
-                polygon = np.array(cell['segmentation']['polygon'], dtype=np.int32)
-                cv2.fillPoly(mask, [polygon], cell_id)
-        
-        return mask
-    
-    def create_coco_segmentation_mask(self, image_shape: Tuple[int, int], 
-                                    annotations: List[Dict]) -> np.ndarray:
-        """
-        Create segmentation mask from COCO format annotations.
-        
-        Args:
-            image_shape: (height, width) of the image
-            annotations: List of COCO annotations
-            
-        Returns:
-            Segmentation mask with cell IDs
-        """
-        mask = np.zeros(image_shape, dtype=np.uint8)
-        
-        for ann_id, ann in enumerate(annotations, 1):
-            if 'segmentation' in ann:
-                segmentation = ann['segmentation']
-                if segmentation:  # Check if not empty
-                    # COCO segmentation can be a list of polygons
-                    if isinstance(segmentation[0], list):
-                        # Multiple polygons for one object
-                        for poly in segmentation:
-                            if len(poly) >= 6:  # At least 3 points (x,y pairs)
-                                polygon = np.array(poly, dtype=np.int32).reshape(-1, 2)
-                                cv2.fillPoly(mask, [polygon], ann_id)
-                    else:
-                        # Single polygon
-                        if len(segmentation) >= 6:  # At least 3 points
-                            polygon = np.array(segmentation, dtype=np.int32).reshape(-1, 2)
-                            cv2.fillPoly(mask, [polygon], ann_id)
-        
-        return mask
-    
-    def resize_image_and_mask(self, image: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Resize image and mask to target size."""
-        # Resize image
-        resized_image = cv2.resize(image, (self.target_size, self.target_size))
-        
-        # Resize mask (nearest neighbor to preserve cell IDs)
-        resized_mask = cv2.resize(mask, (self.target_size, self.target_size), 
-                                interpolation=cv2.INTER_NEAREST)
-        
-        return resized_image, resized_mask
-    
-    def normalize_image(self, image: np.ndarray) -> np.ndarray:
-        """Normalize image to [0, 1] range."""
-        return image.astype(np.float32) / 255.0
-    
-    def process_split(self, split: str) -> Dict[str, Any]:
-        """Process a specific split (train/valid)."""
-        print(f"\n🔄 Processing {split} split...")
-        
-        # Load annotations
-        coco_data = self.load_annotations(split)
-        if not coco_data:
-            return {}
-        
-        processed_data = {
-            'images': [],
-            'masks': [],
-            'metadata': []
-        }
-        
-        # Get images and annotations
-        images = coco_data.get('images', [])
-        annotations = coco_data.get('annotations', [])
-        
-        # Group annotations by image_id
-        annotations_by_image = {}
-        for ann in annotations:
-            image_id = ann['image_id']
-            if image_id not in annotations_by_image:
-                annotations_by_image[image_id] = []
-            annotations_by_image[image_id].append(ann)
-        
-        for i, image_info in enumerate(images):
-            image_id = image_info['id']
-            image_filename = image_info['file_name']
-            
-            # Get image path
-            image_path = self.data_dir / "images" / image_filename
-            
-            if not image_path.exists():
-                print(f"⚠️  Image not found: {image_path}")
-                continue
-            
-            # Load image
-            image = cv2.imread(str(image_path))
-            if image is None:
-                print(f"❌ Failed to load image: {image_path}")
-                continue
-            
-            # Convert BGR to RGB
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            original_shape = image.shape[:2]
-            
-            # Get annotations for this image
-            image_annotations = annotations_by_image.get(image_id, [])
-            
-            # Create segmentation mask from COCO annotations
-            mask = self.create_coco_segmentation_mask(original_shape, image_annotations)
-            
-            # Resize image and mask
-            resized_image, resized_mask = self.resize_image_and_mask(image, mask)
-            
-            # Normalize image
-            normalized_image = self.normalize_image(resized_image)
-            
-            # Save processed data
-            processed_image_path = self.processed_dir / "images" / f"{split}_{i:03d}.png"
-            processed_mask_path = self.processed_dir / "masks" / f"{split}_{i:03d}.png"
-            
-            # Save as PNG
-            cv2.imwrite(str(processed_image_path), (resized_image * 255).astype(np.uint8))
-            cv2.imwrite(str(processed_mask_path), resized_mask)
-            
-            # Store metadata
-            metadata = {
-                'image_id': image_id,
-                'filename': image_filename,
-                'original_shape': original_shape,
-                'target_shape': (self.target_size, self.target_size),
-                'num_cells': len(image_annotations),
-                'image_path': str(processed_image_path),
-                'mask_path': str(processed_mask_path)
-            }
-            
-            processed_data['images'].append(normalized_image)
-            processed_data['masks'].append(resized_mask)
-            processed_data['metadata'].append(metadata)
-            
-            print(f"  ✅ Processed {image_filename}: {len(image_annotations)} cells")
-        
-        print(f"✅ Processed {len(processed_data['images'])} images for {split}")
-        return processed_data
-    
-    def process_split_from_coco(self, coco_data, split_name):
-        """Process a specific split from COCO data."""
-        print(f"\n🔄 Processing {split_name} split from COCO data...")
-        
-        processed_data = {
-            'images': [],
-            'masks': [],
-            'metadata': []
-        }
-        
-        # Get images and annotations
-        images = coco_data.get('images', [])
-        annotations = coco_data.get('annotations', [])
-        
-        # Group annotations by image_id
-        annotations_by_image = {}
-        for ann in annotations:
-            image_id = ann['image_id']
-            if image_id not in annotations_by_image:
-                annotations_by_image[image_id] = []
-            annotations_by_image[image_id].append(ann)
-        
-        for i, image_info in enumerate(images):
-            image_id = image_info['id']
-            image_filename = image_info['file_name']
-            
-            # Get image path
-            image_path = self.data_dir / "images" / image_filename
-            
-            if not image_path.exists():
-                print(f"⚠️  Image not found: {image_path}")
-                continue
-            
-            # Load image
-            image = cv2.imread(str(image_path))
-            if image is None:
-                print(f"❌ Failed to load image: {image_path}")
-                continue
-            
-            # Convert BGR to RGB
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            original_shape = image.shape[:2]
-            
-            # Get annotations for this image
-            image_annotations = annotations_by_image.get(image_id, [])
-            
-            # Create segmentation mask from COCO annotations
-            mask = self.create_coco_segmentation_mask(original_shape, image_annotations)
-            
-            # Resize image and mask
-            resized_image, resized_mask = self.resize_image_and_mask(image, mask)
-            
-            # Normalize image
-            normalized_image = self.normalize_image(resized_image)
-            
-            # Save processed data
-            processed_image_path = self.processed_dir / "images" / f"{split_name}_{i:03d}.png"
-            processed_mask_path = self.processed_dir / "masks" / f"{split_name}_{i:03d}.png"
-            
-            # Save as PNG
-            cv2.imwrite(str(processed_image_path), (resized_image * 255).astype(np.uint8))
-            cv2.imwrite(str(processed_mask_path), resized_mask)
-            
-            # Store metadata
-            metadata = {
-                'image_id': image_id,
-                'filename': image_filename,
-                'original_shape': original_shape,
-                'target_shape': (self.target_size, self.target_size),
-                'num_cells': len(image_annotations),
-                'image_path': str(processed_image_path),
-                'mask_path': str(processed_mask_path)
-            }
-            
-            processed_data['images'].append(normalized_image)
-            processed_data['masks'].append(resized_mask)
-            processed_data['metadata'].append(metadata)
-            
-            print(f"  ✅ Processed {image_filename}: {len(image_annotations)} cells")
-        
-        print(f"✅ Processed {len(processed_data['images'])} images for {split_name}")
-        return processed_data
-    
-    def create_train_valid_split(self):
-        """Create train/validation split from processed data with 80/20 ratio."""
-        print("\n📊 Creating 80/20 train/validation split...")
-        
-        # Load all images and annotations
-        all_images = []
-        all_annotations = []
-        
-        # Load train data
-        train_coco = self.load_annotations('train')
-        if train_coco:
-            all_images.extend(train_coco.get('images', []))
-            all_annotations.extend(train_coco.get('annotations', []))
-        
-        # Load valid data
-        valid_coco = self.load_annotations('valid')
-        if valid_coco:
-            all_images.extend(valid_coco.get('images', []))
-            all_annotations.extend(valid_coco.get('annotations', []))
-        
-        print(f"📊 Total images: {len(all_images)}")
-        print(f"📊 Total annotations: {len(all_annotations)}")
-        
-        # Create 80/20 split
-        np.random.seed(42)  # For reproducibility
-        indices = np.random.permutation(len(all_images))
-        
-        # 80% for training, 20% for validation
-        train_size = int(0.8 * len(all_images))
-        train_indices = indices[:train_size]
-        valid_indices = indices[train_size:]
-        
-        print(f"📊 Train: {len(train_indices)} images (80%)")
-        print(f"📊 Valid: {len(valid_indices)} images (20%)")
-        
-        # Create new train/valid splits
-        train_images = [all_images[i] for i in train_indices]
-        valid_images = [all_images[i] for i in valid_indices]
-        
-        # Create new COCO format data
-        train_coco_new = {
-            'images': train_images,
-            'annotations': [ann for ann in all_annotations if ann['image_id'] in [img['id'] for img in train_images]],
-            'categories': train_coco.get('categories', []) if train_coco else []
-        }
-        
-        valid_coco_new = {
-            'images': valid_images,
-            'annotations': [ann for ann in all_annotations if ann['image_id'] in [img['id'] for img in valid_images]],
-            'categories': valid_coco.get('categories', []) if valid_coco else []
-        }
-        
-        # Process the new splits
-        train_data = self.process_split_from_coco(train_coco_new, 'train')
-        valid_data = self.process_split_from_coco(valid_coco_new, 'valid')
-        
-        # Save split information
-        split_info = {
-            'train': {
-                'num_images': len(train_data.get('images', [])),
-                'num_cells': sum(meta['num_cells'] for meta in train_data.get('metadata', []))
-            },
-            'valid': {
-                'num_images': len(valid_data.get('images', [])),
-                'num_cells': sum(meta['num_cells'] for meta in valid_data.get('metadata', []))
-            }
-        }
-        
-        # Save split info
-        split_path = self.processed_dir / "split_info.json"
-        with open(split_path, 'w') as f:
-            json.dump(split_info, f, indent=2)
-        
-        print(f"✅ Split info saved to: {split_path}")
-        return split_info
-    
-    def create_dataset_summary(self):
-        """Create a summary of the processed dataset."""
-        print("\n📋 Creating dataset summary...")
-        
-        # Count files
-        image_files = list(self.processed_dir.glob("images/*.png"))
-        mask_files = list(self.processed_dir.glob("masks/*.png"))
-        
-        # Load split info
-        split_path = self.processed_dir / "split_info.json"
-        split_info = {}
-        if split_path.exists():
-            with open(split_path, 'r') as f:
-                split_info = json.load(f)
-        
-        summary = {
-            'dataset_name': 'Revvity-25',
-            'preprocessing': {
-                'target_size': self.target_size,
-                'normalization': '0-1 range',
-                'format': 'PNG'
-            },
-            'statistics': {
-                'total_images': len(image_files),
-                'total_masks': len(mask_files),
-                'splits': split_info
-            },
-            'file_structure': {
-                'images': str(self.processed_dir / "images"),
-                'masks': str(self.processed_dir / "masks"),
-                'split_info': str(split_path)
-            }
-        }
-        
-        # Save summary
-        summary_path = self.processed_dir / "dataset_summary.json"
-        with open(summary_path, 'w') as f:
-            json.dump(summary, f, indent=2)
-        
-        print(f"✅ Dataset summary saved to: {summary_path}")
-        return summary
-    
-    def visualize_sample(self, split: str = 'train', sample_idx: int = 0):
-        """Visualize a sample from the processed dataset."""
-        print(f"\n🖼️  Visualizing sample {sample_idx} from {split}...")
-        
-        # Find sample files
-        image_path = self.processed_dir / "images" / f"{split}_{sample_idx:03d}.png"
-        mask_path = self.processed_dir / "masks" / f"{split}_{sample_idx:03d}.png"
-        
-        if not image_path.exists() or not mask_path.exists():
-            print(f"❌ Sample files not found")
-            return
-        
-        # Load image and mask
-        image = cv2.imread(str(image_path))
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
-        
-        # Create visualization
-        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-        
-        # Original image
-        axes[0].imshow(image)
-        axes[0].set_title(f'{split} Image {sample_idx}')
-        axes[0].axis('off')
-        
-        # Segmentation mask
-        axes[1].imshow(mask, cmap='tab20')
-        axes[1].set_title(f'Segmentation Mask ({mask.max()} cells)')
-        axes[1].axis('off')
-        
-        # Overlay
-        overlay = image.copy()
-        overlay[mask > 0] = [255, 0, 0]  # Red overlay for cells
-        axes[2].imshow(overlay)
-        axes[2].set_title('Overlay')
-        axes[2].axis('off')
-        
-        plt.tight_layout()
-        
-        # Save visualization
-        viz_path = self.processed_dir / f"sample_visualization_{split}_{sample_idx}.png"
-        plt.savefig(viz_path, dpi=150, bbox_inches='tight')
-        print(f"✅ Visualization saved to: {viz_path}")
-        
-        plt.show()
 
-def main():
-    """Main preprocessing function."""
-    print("🚀 Revvity-25 Dataset Preprocessing Pipeline")
+def preprocess_revvity25(data_dir="data/Revvity-25", target_size=512):
+    """
+    Preprocess Revvity-25 dataset into simple image/mask format.
+    
+    Following micro-sam tutorial: just need images and instance masks.
+    """
+    print("🚀 Preprocessing Revvity-25 Dataset")
     print("="*60)
     
-    # Initialize preprocessor
-    preprocessor = Revvity25Preprocessor(target_size=512)
+    data_dir = Path(data_dir)
+    processed_dir = data_dir / "processed"
+    processed_dir.mkdir(exist_ok=True)
     
-    # Process the dataset
-    split_info = preprocessor.create_train_valid_split()
+    # Create simple structure: images and labels folders
+    images_dir = processed_dir / "images"
+    labels_dir = processed_dir / "labels"
+    images_dir.mkdir(exist_ok=True)
+    labels_dir.mkdir(exist_ok=True)
     
-    # Create dataset summary
-    summary = preprocessor.create_dataset_summary()
+    # Process train and valid splits
+    for split in ["train", "valid"]:
+        print(f"\n📊 Processing {split} split...")
+        
+        # Load COCO annotations
+        ann_path = data_dir / "annotations" / f"{split}.json"
+        with open(ann_path, 'r') as f:
+            coco_data = json.load(f)
+        
+        images_info = coco_data['images']
+        annotations = coco_data['annotations']
+        
+        # Group annotations by image_id
+        anns_by_image = {}
+        for ann in annotations:
+            img_id = ann['image_id']
+            if img_id not in anns_by_image:
+                anns_by_image[img_id] = []
+            anns_by_image[img_id].append(ann)
+        
+        # Process each image
+        for idx, img_info in enumerate(images_info):
+            img_id = img_info['id']
+            img_name = img_info['file_name']
+            
+            # Load image
+            img_path = data_dir / "images" / img_name
+            image = cv2.imread(str(img_path))
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            h, w = image.shape[:2]
+            
+            # Create instance mask from COCO polygons
+            mask = np.zeros((h, w), dtype=np.uint16)
+            image_anns = anns_by_image.get(img_id, [])
+            
+            for obj_id, ann in enumerate(image_anns, start=1):
+                if 'segmentation' in ann and ann['segmentation']:
+                    for poly in ann['segmentation']:
+                        if len(poly) >= 6:  # At least 3 points
+                            polygon = np.array(poly).reshape(-1, 2).astype(np.int32)
+                            cv2.fillPoly(mask, [polygon], obj_id)
+            
+            # Resize to target size
+            image_resized = cv2.resize(image, (target_size, target_size))
+            mask_resized = cv2.resize(mask, (target_size, target_size), interpolation=cv2.INTER_NEAREST)
+            
+            # Save with simple naming: split_idx.tif
+            out_name = f"{split}_{idx:03d}.tif"
+            # Save as grayscale 2D images (micro-sam expects 2D)
+            image_gray = cv2.cvtColor(image_resized, cv2.COLOR_RGB2GRAY)
+            cv2.imwrite(str(images_dir / out_name), image_gray)
+            cv2.imwrite(str(labels_dir / out_name), mask_resized)
+            
+            print(f"  ✅ {out_name}: {len(image_anns)} cells")
+        
+        print(f"✅ Processed {len(images_info)} {split} images")
     
-    # Visualize a sample
-    preprocessor.visualize_sample('train', 0)
+    # Save split info
+    split_info = {
+        'train_images': len([f for f in os.listdir(images_dir) if f.startswith('train_')]),
+        'valid_images': len([f for f in os.listdir(images_dir) if f.startswith('valid_')]),
+        'image_size': target_size,
+        'format': 'tif'
+    }
     
-    print("\n🎉 Dataset preprocessing completed!")
-    print("\n📋 What we have:")
-    print("✅ Processed images (512x512)")
-    print("✅ Segmentation masks")
-    print("✅ Train/validation split")
-    print("✅ Dataset summary and statistics")
-    print("✅ Sample visualizations")
-    print("\n📁 Check data/revvity25/processed/ directory")
+    with open(processed_dir / "split_info.json", 'w') as f:
+        json.dump(split_info, f, indent=2)
+    
+    print(f"\n✅ Preprocessing complete!")
+    print(f"   Images: {processed_dir / 'images'}")
+    print(f"   Labels: {processed_dir / 'labels'}")
+    print(f"   Train: {split_info['train_images']} images")
+    print(f"   Valid: {split_info['valid_images']} images")
+    
+    # Visualize one sample
+    visualize_sample(images_dir, labels_dir, "train_000.tif", processed_dir)
+    
+    return processed_dir
+
+
+def visualize_sample(images_dir, labels_dir, filename, save_dir):
+    """Visualize a sample image and mask."""
+    img = cv2.imread(str(images_dir / filename))
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    mask = cv2.imread(str(labels_dir / filename), cv2.IMREAD_UNCHANGED)
+    
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    
+    axes[0].imshow(img)
+    axes[0].set_title('Image')
+    axes[0].axis('off')
+    
+    axes[1].imshow(mask, cmap='tab20')
+    axes[1].set_title(f'Mask ({mask.max()} cells)')
+    axes[1].axis('off')
+    
+    axes[2].imshow(img, alpha=0.7)
+    axes[2].imshow(mask, cmap='tab20', alpha=0.3)
+    axes[2].set_title('Overlay')
+    axes[2].axis('off')
+    
+    plt.tight_layout()
+    plt.savefig(save_dir / 'sample_visualization.png', dpi=150, bbox_inches='tight')
+    print(f"   Visualization: {save_dir / 'sample_visualization.png'}")
+    plt.close()
+
 
 if __name__ == "__main__":
-    main()
+    preprocess_revvity25()

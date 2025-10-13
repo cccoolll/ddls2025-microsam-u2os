@@ -1,350 +1,127 @@
 #!/usr/bin/env python3
 """
-Training script for microSAM AIS (Auto Instance Segmentation) head on Revvity-25 dataset.
-This script focuses on fine-tuning the Segmentation Decoder for zero-prompt cell segmentation.
+Simple training script for microSAM AIS following the tutorial pattern.
 """
 
 import os
-import argparse
-import json
-import torch
 import numpy as np
-from pathlib import Path
-from torch.utils.data import Dataset, DataLoader
-from torch_em.transform.label import PerObjectDistanceTransform
-import imageio.v3 as imageio
-
+import torch
+from torch_em.data import MinInstanceSampler
 import micro_sam.training as sam_training
-from micro_sam.util import export_custom_sam_model
-from micro_sam.training.util import identity
 
 
-class Revvity25Dataset(Dataset):
-    """Dataset class for Revvity-25 brightfield microscopy images."""
-    
-    def __init__(self, data_dir, split="train", transform=None, label_transform=None):
-        """
-        Initialize the dataset.
-        
-        Args:
-            data_dir: Path to the processed dataset directory
-            split: 'train' or 'valid'
-            transform: Transform to apply to images
-            label_transform: Transform to apply to labels
-        """
-        self.data_dir = Path(data_dir)
-        self.split = split
-        self.transform = transform
-        self.label_transform = label_transform
-        
-        # Get list of processed image files
-        images_dir = self.data_dir / "processed" / "images"
-        if split == "train":
-            self.image_files = [f for f in os.listdir(images_dir) if f.startswith("train_") and f.endswith(".png")]
-        else:
-            self.image_files = [f for f in os.listdir(images_dir) if f.startswith("valid_") and f.endswith(".png")]
-        
-        print(f"📊 Loaded {len(self.image_files)} {split} images")
-        
-    def __len__(self):
-        return len(self.image_files)
-    
-    def __getitem__(self, idx):
-        # Load image
-        img_path = self.data_dir / "processed" / "images" / self.image_files[idx]
-        image = imageio.imread(img_path)
-        
-        # Convert to RGB if grayscale
-        if len(image.shape) == 2:
-            image = np.stack([image] * 3, axis=-1)
-        elif image.shape[2] == 1:
-            image = np.repeat(image, 3, axis=2)
-        
-        # Load corresponding mask
-        mask_path = self.data_dir / "processed" / "masks" / self.image_files[idx]
-        mask = imageio.imread(mask_path)
-        
-        # Convert to torch tensors
-        image = torch.from_numpy(image).permute(2, 0, 1).float()  # HWC -> CHW
-        mask = torch.from_numpy(mask).long()
-        
-        # Apply transforms
-        if self.transform:
-            image = self.transform(image)
-        if self.label_transform:
-            mask = self.label_transform(mask)
-        
-        return image, mask
-
-
-def get_dataloaders(data_dir, patch_shape=(512, 512), batch_size=2, num_workers=4):
+def train_revvity25_ais(
+    data_dir="data/Revvity-25/processed",
+    save_root="models",
+    model_type="vit_b_lm",
+    n_epochs=10,
+    n_objects_per_batch=5,
+    batch_size=1,
+    patch_shape=(512, 512),
+):
     """
-    Create data loaders for Revvity-25 dataset.
+    Train microSAM AIS on Revvity-25 dataset.
     
-    Args:
-        data_dir: Path to the dataset directory
-        patch_shape: Shape of patches for training
-        batch_size: Batch size for training
-        num_workers: Number of worker processes for data loading
-    
-    Returns:
-        train_loader, val_loader: Data loaders for training and validation
+    Following micro-sam tutorial pattern - simple and clean!
     """
-    # Label transform for distance-based segmentation
-    label_transform = PerObjectDistanceTransform(
-        distances=True, 
-        boundary_distances=True, 
-        directed_distances=False, 
-        foreground=True, 
-        instances=True, 
-        min_size=25
-    )
+    print("🚀 Training microSAM AIS on Revvity-25")
+    print("="*60)
     
-    # Raw transform (identity for now, can be customized)
-    raw_transform = identity
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Device: {device}")
     
-    # Create datasets
-    train_dataset = Revvity25Dataset(
-        data_dir=data_dir,
-        split="train",
-        transform=raw_transform,
-        label_transform=label_transform
-    )
+    # Setup paths (following tutorial pattern)
+    images_dir = os.path.join(data_dir, "images")
+    labels_dir = os.path.join(data_dir, "labels")
     
-    val_dataset = Revvity25Dataset(
-        data_dir=data_dir,
-        split="valid", 
-        transform=raw_transform,
-        label_transform=label_transform
-    )
+    # Define ROIs for train/val split (following tutorial)
+    # Count files to determine split
+    import glob
+    train_files = sorted(glob.glob(os.path.join(images_dir, "train_*.tif")))
+    valid_files = sorted(glob.glob(os.path.join(images_dir, "valid_*.tif")))
     
-    # Create data loaders
-    train_loader = DataLoader(
-        train_dataset,
+    print(f"Train images: {len(train_files)}")
+    print(f"Valid images: {len(valid_files)}")
+    
+    # Use MinInstanceSampler to ensure we sample patches with objects
+    sampler = MinInstanceSampler(min_size=25)
+    
+    # Create dataloaders using micro-sam's default_sam_loader (from tutorial)
+    train_loader = sam_training.default_sam_loader(
+        raw_paths=images_dir,
+        raw_key="train_*.tif",  # Pattern to match train images
+        label_paths=labels_dir,
+        label_key="train_*.tif",  # Pattern to match train labels
+        with_segmentation_decoder=True,  # Enable AIS training
+        patch_shape=(1, *patch_shape),  # (channels, height, width)
         batch_size=batch_size,
         shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True,
-        drop_last=True
-    )
-    train_loader.shuffle = True  # Add shuffle attribute
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=1,  # Use batch size 1 for validation
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True
-    )
-    val_loader.shuffle = False  # Add shuffle attribute
-    
-    return train_loader, val_loader
-
-
-def finetune_revvity25_ais(args):
-    """
-    Fine-tune microSAM AIS head on Revvity-25 dataset.
-    
-    This function focuses on training the Auto Instance Segmentation (AIS) head
-    for zero-prompt cell segmentation without user interaction.
-    
-    IMPORTANT TRAINING STRATEGY:
-    - Only freeze image_encoder (default) - this allows the mask_decoder to adapt
-    - The UNETR segmentation decoder will also be trained
-    - Freezing both encoder AND mask_decoder (previous approach) prevented learning!
-    - This follows the micro-sam best practices from DeepBacs/TissueNet examples
-    """
-    print("🚀 Starting microSAM AIS fine-tuning on Revvity-25 dataset")
-    print(f"📁 Data directory: {args.data_dir}")
-    print(f"🤖 Model type: {args.model_type}")
-    print(f"💾 Save directory: {args.save_root}")
-    
-    # Set device
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"🖥️  Using device: {device}")
-    
-    if device == "cpu":
-        print("⚠️  Warning: CUDA not available, training will be very slow!")
-    
-    # Training configuration
-    model_type = args.model_type
-    checkpoint_path = None  # Start from pre-trained weights
-    patch_shape = (512, 512)  # Fixed patch size for U2OS cells
-    n_objects_per_batch = args.n_objects
-    freeze_parts = args.freeze  # Parts to freeze during training
-    checkpoint_name = f"{args.model_type}/revvity25_ais"
-    
-    # Create data loaders
-    print("📊 Creating data loaders...")
-    train_loader, val_loader = get_dataloaders(
-        data_dir=args.data_dir,
-        patch_shape=patch_shape,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers
+        sampler=sampler,
     )
     
-    # Learning rate scheduler configuration
-    scheduler_kwargs = {
-        "mode": "min", 
-        "factor": 0.9, 
-        "patience": 5  # Reduced patience for faster adaptation
-    }
-    
-    print("🏋️  Starting training...")
-    print(f"   - Training samples: {len(train_loader.dataset)}")
-    print(f"   - Validation samples: {len(val_loader.dataset)}")
-    print(f"   - Batch size: {args.batch_size}")
-    print(f"   - Objects per batch: {n_objects_per_batch}")
-    print(f"   - Learning rate: {args.learning_rate}")
-    print(f"   - Max iterations: {args.iterations}")
-    print(f"   - Frozen parts: {freeze_parts if freeze_parts else 'None (full fine-tuning)'}")
-    print(f"   - Strategy: {'Only image_encoder frozen - mask_decoder will adapt!' if freeze_parts == ['image_encoder'] else 'Custom freeze strategy'}")
-    
-    # Run AIS training (Auto Instance Segmentation with UNETR decoder)
-    print("🤖 Starting AIS training with UNETR decoder...")
-    
-    training_kwargs = {
-        "name": checkpoint_name,
-        "model_type": model_type,
-        "train_loader": train_loader,
-        "val_loader": val_loader,
-        "early_stopping": 10,
-        "n_objects_per_batch": n_objects_per_batch,
-        "checkpoint_path": checkpoint_path,
-        "freeze": freeze_parts,
-        "device": device,
-        "lr": args.learning_rate,
-        "n_iterations": args.iterations,
-        "save_root": args.save_root,
-        "scheduler_kwargs": scheduler_kwargs,
-        "with_segmentation_decoder": True,  # Enable AIS training with UNETR decoder
-    }
-    
-    # Only add save_every_kth_epoch if it's not None
-    if args.save_every_kth_epoch is not None:
-        training_kwargs["save_every_kth_epoch"] = args.save_every_kth_epoch
-    
-    # Use train_sam with segmentation decoder for AIS training (includes UNETR decoder)
-    sam_training.train_sam(**training_kwargs)
-    
-    # Export the trained model
-    if args.export_path is not None:
-        print("📤 Exporting trained model...")
-        checkpoint_path = os.path.join(
-            "" if args.save_root is None else args.save_root, 
-            "checkpoints", 
-            checkpoint_name, 
-            "best.pt"
-        )
-        export_custom_sam_model(
-            checkpoint_path=checkpoint_path, 
-            model_type=model_type, 
-            save_path=args.export_path,
-        )
-        print(f"✅ Model exported to: {args.export_path}")
-    
-    print("🎉 Training completed!")
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Fine-tune microSAM AIS head for Revvity-25 U2OS cell segmentation."
+    val_loader = sam_training.default_sam_loader(
+        raw_paths=images_dir,
+        raw_key="valid_*.tif",
+        label_paths=labels_dir,
+        label_key="valid_*.tif",
+        with_segmentation_decoder=True,
+        patch_shape=(1, *patch_shape),
+        batch_size=batch_size,
+        shuffle=True,
+        sampler=sampler,
     )
     
-    # Data arguments
-    parser.add_argument(
-        "--data_dir", "-d", 
-        default="/home/tao/workspace/ddls2025-microsam-u2os/data/Revvity-25",
-        help="Path to the Revvity-25 dataset directory"
+    print(f"\nTraining configuration:")
+    print(f"  Model: {model_type}")
+    print(f"  Epochs: {n_epochs}")
+    print(f"  Batch size: {batch_size}")
+    print(f"  Objects per batch: {n_objects_per_batch}")
+    print(f"  Patch shape: {patch_shape}")
+    print(f"  AIS training: True")
+    
+    # Train the model (following tutorial - simple!)
+    checkpoint_name = "revvity25_ais"
+    
+    print(f"\n🏋️  Starting training...")
+    sam_training.train_sam(
+        name=checkpoint_name,
+        save_root=save_root,
+        model_type=model_type,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        n_epochs=n_epochs,
+        n_objects_per_batch=n_objects_per_batch,
+        with_segmentation_decoder=True,  # Enable AIS
+        device=device,
     )
     
-    # Model arguments
-    parser.add_argument(
-        "--model_type", "-m", 
-        default="vit_b_lm",
-        choices=["vit_t", "vit_b", "vit_l", "vit_h", "vit_b_lm"],
-        help="microSAM model type to use for fine-tuning"
-    )
+    best_checkpoint = os.path.join(save_root, "checkpoints", checkpoint_name, "best.pt")
+    print(f"\n🎉 Training complete!")
+    print(f"   Best checkpoint: {best_checkpoint}")
     
-    # Training arguments
-    parser.add_argument(
-        "--save_root", "-s",
-        default="/home/tao/workspace/ddls2025-microsam-u2os/models",
-        help="Directory to save checkpoints and logs"
-    )
-    
-    parser.add_argument(
-        "--iterations", "-i", 
-        type=int, 
-        default=20000,
-        help="Number of training iterations (default: 20000, longer training for better convergence)"
-    )
-    
-    parser.add_argument(
-        "--batch_size", "-b",
-        type=int,
-        default=1,
-        help="Batch size for training (default: 1, memory optimized for RTX 3080)"
-    )
-    
-    parser.add_argument(
-        "--learning_rate", "-lr",
-        type=float,
-        default=5e-5,
-        help="Learning rate for training (default: 5e-5, increased for better gradient flow)"
-    )
-    
-    parser.add_argument(
-        "--n_objects", "-n",
-        type=int,
-        default=10,
-        help="Number of objects per batch for training (default: 10, memory optimized for RTX 3080)"
-    )
-    
-    parser.add_argument(
-        "--num_workers", "-w",
-        type=int,
-        default=4,
-        help="Number of worker processes for data loading (default: 4)"
-    )
-    
-    # Fine-tuning strategy arguments
-    parser.add_argument(
-        "--freeze", 
-        type=str, 
-        nargs="+", 
-        default=["image_encoder"],
-        help="Model parts to freeze during training (default: only 'image_encoder' - allows mask_decoder to adapt)"
-    )
-    
-    parser.add_argument(
-        "--lora_rank", 
-        type=int, 
-        default=None,
-        help="LoRA rank for parameter-efficient fine-tuning (default: None, use full fine-tuning)"
-    )
-    
-    # Export arguments
-    parser.add_argument(
-        "--export_path", "-e",
-        help="Path to export the final trained model"
-    )
-    
-    parser.add_argument(
-        "--save_every_kth_epoch", 
-        type=int, 
-        default=None,
-        help="Save checkpoint every k epochs (default: None, only save best and latest)"
-    )
-    
-    args = parser.parse_args()
-    
-    # Create save directory if it doesn't exist
-    os.makedirs(args.save_root, exist_ok=True)
-    
-    # Start training
-    finetune_revvity25_ais(args)
+    return best_checkpoint
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Train microSAM AIS on Revvity-25")
+    parser.add_argument("--data_dir", default="data/Revvity-25/processed", help="Processed data directory")
+    parser.add_argument("--save_root", default="models", help="Save directory for checkpoints")
+    parser.add_argument("--model_type", default="vit_b_lm", help="Model type")
+    parser.add_argument("--n_epochs", type=int, default=10, help="Number of epochs")
+    parser.add_argument("--n_objects", type=int, default=5, help="Objects per batch")
+    parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
+    parser.add_argument("--patch_shape", type=int, default=512, help="Patch shape (square)")
+    
+    args = parser.parse_args()
+    
+    train_revvity25_ais(
+        data_dir=args.data_dir,
+        save_root=args.save_root,
+        model_type=args.model_type,
+        n_epochs=args.n_epochs,
+        n_objects_per_batch=args.n_objects,
+        batch_size=args.batch_size,
+        patch_shape=(args.patch_shape, args.patch_shape),
+    )
