@@ -147,6 +147,12 @@ def finetune_revvity25_ais(args):
     
     This function focuses on training the Auto Instance Segmentation (AIS) head
     for zero-prompt cell segmentation without user interaction.
+    
+    IMPORTANT TRAINING STRATEGY:
+    - Only freeze image_encoder (default) - this allows the mask_decoder to adapt
+    - The UNETR segmentation decoder will also be trained
+    - Freezing both encoder AND mask_decoder (previous approach) prevented learning!
+    - This follows the micro-sam best practices from DeepBacs/TissueNet examples
     """
     print("🚀 Starting microSAM AIS fine-tuning on Revvity-25 dataset")
     print(f"📁 Data directory: {args.data_dir}")
@@ -181,7 +187,7 @@ def finetune_revvity25_ais(args):
     scheduler_kwargs = {
         "mode": "min", 
         "factor": 0.9, 
-        "patience": 10
+        "patience": 5  # Reduced patience for faster adaptation
     }
     
     print("🏋️  Starting training...")
@@ -191,6 +197,8 @@ def finetune_revvity25_ais(args):
     print(f"   - Objects per batch: {n_objects_per_batch}")
     print(f"   - Learning rate: {args.learning_rate}")
     print(f"   - Max iterations: {args.iterations}")
+    print(f"   - Frozen parts: {freeze_parts if freeze_parts else 'None (full fine-tuning)'}")
+    print(f"   - Strategy: {'Only image_encoder frozen - mask_decoder will adapt!' if freeze_parts == ['image_encoder'] else 'Custom freeze strategy'}")
     
     # Run AIS training (Auto Instance Segmentation with UNETR decoder)
     print("🤖 Starting AIS training with UNETR decoder...")
@@ -246,7 +254,7 @@ def main():
     # Data arguments
     parser.add_argument(
         "--data_dir", "-d", 
-        default="/home/scheng/workspace/ddls2025-microsam-u2os/data",
+        default="/home/tao/workspace/ddls2025-microsam-u2os/data/Revvity-25",
         help="Path to the Revvity-25 dataset directory"
     )
     
@@ -261,36 +269,36 @@ def main():
     # Training arguments
     parser.add_argument(
         "--save_root", "-s",
-        default="/home/scheng/workspace/ddls2025-microsam-u2os/models",
+        default="/home/tao/workspace/ddls2025-microsam-u2os/models",
         help="Directory to save checkpoints and logs"
     )
     
     parser.add_argument(
         "--iterations", "-i", 
         type=int, 
-        default=10000,
-        help="Number of training iterations (default: 10000)"
+        default=20000,
+        help="Number of training iterations (default: 20000, longer training for better convergence)"
     )
     
     parser.add_argument(
         "--batch_size", "-b",
         type=int,
-        default=2,
-        help="Batch size for training (default: 2)"
+        default=1,
+        help="Batch size for training (default: 1, memory optimized for RTX 3080)"
     )
     
     parser.add_argument(
         "--learning_rate", "-lr",
         type=float,
-        default=1e-5,
-        help="Learning rate for training (default: 1e-5)"
+        default=5e-5,
+        help="Learning rate for training (default: 5e-5, increased for better gradient flow)"
     )
     
     parser.add_argument(
         "--n_objects", "-n",
         type=int,
-        default=15,
-        help="Number of objects per batch for training (default: 15)"
+        default=10,
+        help="Number of objects per batch for training (default: 10, memory optimized for RTX 3080)"
     )
     
     parser.add_argument(
@@ -305,8 +313,8 @@ def main():
         "--freeze", 
         type=str, 
         nargs="+", 
-        default=None,
-        help="Model parts to freeze during training (e.g., 'image_encoder' 'mask_decoder')"
+        default=["image_encoder"],
+        help="Model parts to freeze during training (default: only 'image_encoder' - allows mask_decoder to adapt)"
     )
     
     parser.add_argument(
