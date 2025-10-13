@@ -119,6 +119,16 @@ def train_revvity25_ais(
     # Train the model with optimized parameters
     checkpoint_name = "revvity25_ais_optimized"
     
+    # Check if we should resume from existing checkpoint
+    latest_checkpoint = os.path.join(save_root, "checkpoints", checkpoint_name, "latest.pt")
+    resume_from_checkpoint = None
+    if os.path.exists(latest_checkpoint):
+        print(f"🔄 Found existing checkpoint: {latest_checkpoint}")
+        print("   Resuming training from latest checkpoint...")
+        resume_from_checkpoint = latest_checkpoint
+    else:
+        print(f"🆕 No existing checkpoint found, starting fresh training...")
+    
     print(f"\n🏋️  Starting optimized training...")
     sam_training.train_sam(
         name=checkpoint_name,
@@ -137,6 +147,8 @@ def train_revvity25_ais(
         save_every_kth_epoch=save_every_kth_epoch,  # Save checkpoints
         n_sub_iteration=6,  # Reduced from default 8 for efficiency
         mask_prob=0.6,  # Increased mask probability for better training
+        checkpoint_path=resume_from_checkpoint,  # Resume from checkpoint if available
+        overwrite_training=False,  # Don't overwrite if resuming
     )
     
     best_checkpoint = os.path.join(save_root, "checkpoints", checkpoint_name, "best.pt")
