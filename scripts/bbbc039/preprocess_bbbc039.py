@@ -85,14 +85,22 @@ def preprocess_bbbc039(data_dir="data/BBBC039", target_size=512):
                     continue
                 
                 # Convert mask to instance segmentation format
-                # BBBC039 masks are typically binary or multi-class
-                # Convert to instance IDs if needed
+                # BBBC039 masks are RGBA with individual cell instances in Channel 2 (blue)
                 if len(mask.shape) == 3:
-                    # Convert to grayscale
-                    mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
+                    # For RGBA masks, use Channel 2 (blue) which contains the instance information
+                    if mask.shape[2] == 4:  # RGBA
+                        # Use Channel 2 (blue) which contains the individual cell instances
+                        mask = mask[:, :, 2]  # Blue channel with instance IDs
+                    else:  # RGB
+                        # Convert to grayscale but preserve unique values
+                        mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
                 
                 # Ensure mask is uint16 for instance IDs
                 mask = mask.astype(np.uint16)
+                
+                # Debug: Check mask values before resizing
+                unique_vals = np.unique(mask)
+                print(f"    Original mask unique values: {len(unique_vals)} - {unique_vals[:10]}")
                 
                 # Get original dimensions
                 h, w = image.shape[:2]
@@ -100,6 +108,10 @@ def preprocess_bbbc039(data_dir="data/BBBC039", target_size=512):
                 # Resize to target size
                 image_resized = cv2.resize(image, (target_size, target_size))
                 mask_resized = cv2.resize(mask, (target_size, target_size), interpolation=cv2.INTER_NEAREST)
+                
+                # Debug: Check mask values after resizing
+                unique_vals_resized = np.unique(mask_resized)
+                print(f"    Resized mask unique values: {len(unique_vals_resized)} - {unique_vals_resized[:10]}")
                 
                 # Convert to grayscale for microSAM (expects 2D images)
                 if len(image_resized.shape) == 3:
