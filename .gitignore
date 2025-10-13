@@ -2,9 +2,6 @@
 
 # Data directories
 data/
-*.png
-*.jpg
-*.jpeg
 *.json
 *.pkl
 *.h5
@@ -18,7 +15,6 @@ models/
 *.safetensors
 
 # Results and outputs
-results/
 outputs/
 logs/
 wandb/
