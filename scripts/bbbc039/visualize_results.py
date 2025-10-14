@@ -127,9 +127,13 @@ def evaluate_bbbc039_models_comparison(
             print(f"    ❌ Fine-tuned model error: {e}")
             continue
         
-        # Ground truth count
-        n_gt = gt_mask.max()
-        print(f"    Ground truth: {n_gt} cells")
+        # Ground truth count - count connected components (actual cells)
+        # The mask has multiple cells but they may share the same ID due to preprocessing issues
+        # So we need to count connected components instead of unique values
+        from scipy import ndimage
+        labeled_mask, num_cells = ndimage.label(gt_mask > 0)
+        n_gt = num_cells
+        print(f"    Ground truth: {n_gt} cells (connected components)")
         
         # Calculate improvement
         improvement = n_finetuned - n_pretrained
@@ -354,7 +358,10 @@ def evaluate_bbbc039_model_only(
                 device=device,
             )
             n_finetuned = finetuned_pred.max()
-            n_gt = gt_mask.max()
+            # Count ground truth cells correctly using connected components
+            from scipy import ndimage
+            labeled_mask, num_cells = ndimage.label(gt_mask > 0)
+            n_gt = num_cells
             print(f"    Fine-tuned: {n_finetuned} cells")
             print(f"    Ground truth: {n_gt} cells")
             print(f"    Error: {abs(n_finetuned - n_gt)} cells")
