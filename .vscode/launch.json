@@ -1,0 +1,45 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python Debugger: Current File",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Test MicroSamTrainer",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/bioengine-app/micro-sam.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+        },
+        {
+            "name": "BioEngine Worker - MicroSamTrainer (Single Machine)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "bioengine.worker",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "envFile": "${workspaceFolder}/.env",
+            "env": {
+                "BIOENGINE_LOCAL_ARTIFACT_PATH": "${workspaceFolder}",
+            },
+            "args": [
+                "--mode", "single-machine",
+                "--head_num_gpus", "1",
+                "--head_num_cpus", "4",
+                "--head_memory_in_gb", "30",
+                "--cache_dir", "${env:HOME}/.bioengine",
+                "--startup_applications", "{\"artifact_id\": \"dummy-workspace/bioengine-app\", \"application_id\": \"micro-sam\"}",
+                "--log_file", "off",
+                "--debug",
+            ]
+        },
+    ]
+}
