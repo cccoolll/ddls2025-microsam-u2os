@@ -1,4 +1,4 @@
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 import numpy as np
 from hypha_rpc.utils.schema import schema_method
@@ -16,24 +16,352 @@ from ray import serve
 )
 class MicroSamTrainer:
     def __init__(self):
+        # Training state
         self.fit_task = None
         self.fit_result = None
         self.fit_error = None
         self.fit_cancelled = False
+        
+        # Model state
+        self.predictor = None
+        self.segmenter = None
+        self.model_type = "vit_b_lm"
+        self.device = "cuda" if self._check_cuda() else "cpu"
+        self.checkpoint_dir = "models/checkpoints"
+        self.current_checkpoint = None
+        
+        # Initialize checkpoint directory
+        import os
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+    
+    def _check_cuda(self):
+        """Check CUDA availability without importing torch at module level."""
+        try:
+            import torch
+            return torch.cuda.is_available()
+        except ImportError:
+            return False
+    
+    def _validate_image_format(self, image: np.ndarray) -> bool:
+        """Validate image format for segmentation."""
+        if not isinstance(image, np.ndarray):
+            return False
+        
+        # Check shape: (C, H, W) where C in [1, 3]
+        if len(image.shape) != 3:
+            return False
+        
+        c, h, w = image.shape
+        if c not in [1, 3] or h <= 0 or w <= 0:
+            return False
+        
+        return True
+    
+    def _validate_coco_annotations(self, annotations: dict) -> bool:
+        """Validate COCO format annotations."""
+        required_keys = ['images', 'annotations', 'categories']
+        
+        # Check required top-level keys
+        if not all(key in annotations for key in required_keys):
+            return False
+        
+        # Check images structure
+        if not isinstance(annotations['images'], list) or len(annotations['images']) == 0:
+            return False
+        
+        # Check annotations structure
+        if not isinstance(annotations['annotations'], list):
+            return False
+        
+        # Check categories structure
+        if not isinstance(annotations['categories'], list) or len(annotations['categories']) == 0:
+            return False
+        
+        return True
+    
+    def _prepare_training_data(self, images: List[np.ndarray], annotations: dict, temp_dir: str) -> str:
+        """Convert COCO format data to .tif files for training."""
+        import os
+        import json
+        import imageio.v3 as imageio
+        from scipy import ndimage
+        
+        # Create subdirectories
+        images_dir = os.path.join(temp_dir, "images")
+        labels_dir = os.path.join(temp_dir, "labels")
+        os.makedirs(images_dir, exist_ok=True)
+        os.makedirs(labels_dir, exist_ok=True)
+        
+        # Create image ID to image mapping
+        image_id_to_image = {img['id']: img for img in annotations['images']}
+        
+        # Create annotation ID to annotation mapping
+        ann_id_to_ann = {ann['id']: ann for ann in annotations['annotations']}
+        
+        # Group annotations by image
+        image_annotations = {}
+        for ann in annotations['annotations']:
+            image_id = ann['image_id']
+            if image_id not in image_annotations:
+                image_annotations[image_id] = []
+            image_annotations[image_id].append(ann)
+        
+        # Process each image
+        for i, image in enumerate(images):
+            # Get corresponding image metadata
+            if i >= len(annotations['images']):
+                break
+                
+            img_meta = annotations['images'][i]
+            image_id = img_meta['id']
+            
+            # Save image as .tif
+            if len(image.shape) == 3 and image.shape[0] in [1, 3]:
+                # Convert (C, H, W) to (H, W) or (H, W, C)
+                if image.shape[0] == 1:
+                    image_2d = image[0]  # (H, W)
+                else:
+                    image_2d = np.transpose(image, (1, 2, 0))  # (H, W, C)
+            else:
+                image_2d = image  # Assume already (H, W)
+            
+            # Normalize to 0-255 if needed
+            if image_2d.max() <= 1.0:
+                image_2d = (image_2d * 255).astype(np.uint8)
+            else:
+                image_2d = image_2d.astype(np.uint8)
+            
+            # Save image
+            img_filename = f"train_{i:03d}.tif"
+            imageio.imwrite(os.path.join(images_dir, img_filename), image_2d)
+            
+            # Create segmentation mask
+            if image_id in image_annotations:
+                h, w = image_2d.shape[:2]
+                mask = np.zeros((h, w), dtype=np.uint16)
+                
+                for ann_idx, ann in enumerate(image_annotations[image_id]):
+                    # Convert COCO segmentation to mask
+                    if 'segmentation' in ann and ann['segmentation']:
+                        # Handle polygon segmentation
+                        for seg in ann['segmentation']:
+                            if len(seg) >= 6:  # At least 3 points
+                                # Convert polygon to mask
+                                from PIL import Image, ImageDraw
+                                pil_mask = Image.new('L', (w, h), 0)
+                                draw = ImageDraw.Draw(pil_mask)
+                                
+                                # Convert flat list to point pairs
+                                points = [(seg[i], seg[i+1]) for i in range(0, len(seg), 2)]
+                                draw.polygon(points, fill=ann_idx + 1)
+                                
+                                # Convert back to numpy
+                                seg_mask = np.array(pil_mask)
+                                mask[seg_mask > 0] = ann_idx + 1
+                
+                # Save label
+                label_filename = f"train_{i:03d}.tif"
+                imageio.imwrite(os.path.join(labels_dir, label_filename), mask)
+        
+        return temp_dir
+    
+    def _load_model(self, checkpoint_path=None):
+        """Lazy load predictor and segmenter."""
+        from micro_sam.automatic_segmentation import get_predictor_and_segmenter
+        
+        # Determine checkpoint to use
+        if checkpoint_path is None:
+            # Check for fine-tuned checkpoint
+            import os
+            best_checkpoint = os.path.join(self.checkpoint_dir, "best.pt")
+            if os.path.exists(best_checkpoint):
+                checkpoint_path = best_checkpoint
+                self.current_checkpoint = checkpoint_path
+            else:
+                checkpoint_path = None  # Use pre-trained
+                self.current_checkpoint = None
+        
+        # Load predictor and segmenter
+        self.predictor, self.segmenter = get_predictor_and_segmenter(
+            model_type=self.model_type,
+            checkpoint=checkpoint_path,
+            device=self.device,
+            is_tiled=False,
+        )
+        
+        return self.predictor, self.segmenter
 
-    async def _fit_background(self, n_epochs: int):
+    async def _fit_background(self, images: List[np.ndarray], annotations: dict, n_epochs: int):
         import torch
+        import os
+        import tempfile
+        import shutil
+        import micro_sam.training as sam_training
+        from torch_em.data import MinInstanceSampler
 
         # Reset cancellation flag
         self.fit_cancelled = False
-
-        pass
+        
+        try:
+            # Create temporary directory for training data
+            temp_dir = tempfile.mkdtemp(prefix="microsam_training_")
+            
+            # Prepare training data
+            self._prepare_training_data(images, annotations, temp_dir)
+            
+            # Check for cancellation
+            if self.fit_cancelled:
+                self.fit_error = "Training cancelled by user"
+                return
+            
+            # Create train/val split (80/20)
+            images_dir = os.path.join(temp_dir, "images")
+            labels_dir = os.path.join(temp_dir, "labels")
+            
+            # Get all image files
+            import glob
+            all_images = sorted(glob.glob(os.path.join(images_dir, "*.tif")))
+            all_labels = sorted(glob.glob(os.path.join(labels_dir, "*.tif")))
+            
+            # Split into train/val
+            split_idx = int(0.8 * len(all_images))
+            train_images = all_images[:split_idx]
+            train_labels = all_labels[:split_idx]
+            val_images = all_images[split_idx:]
+            val_labels = all_labels[split_idx:]
+            
+            # Rename files for train/val split
+            for i, (img_path, label_path) in enumerate(zip(train_images, train_labels)):
+                new_img_path = os.path.join(images_dir, f"train_{i:03d}.tif")
+                new_label_path = os.path.join(labels_dir, f"train_{i:03d}.tif")
+                os.rename(img_path, new_img_path)
+                os.rename(label_path, new_label_path)
+            
+            for i, (img_path, label_path) in enumerate(zip(val_images, val_labels)):
+                new_img_path = os.path.join(images_dir, f"valid_{i:03d}.tif")
+                new_label_path = os.path.join(labels_dir, f"valid_{i:03d}.tif")
+                os.rename(img_path, new_img_path)
+                os.rename(label_path, new_label_path)
+            
+            # Check for cancellation
+            if self.fit_cancelled:
+                self.fit_error = "Training cancelled by user"
+                return
+            
+            # Training configuration (hardcoded from training scripts)
+            batch_size = 2
+            n_objects_per_batch = 8
+            patch_shape = (512, 512)
+            learning_rate = 1e-4
+            freeze_encoder = True
+            early_stopping = 15
+            scheduler_patience = 5
+            
+            # Use MinInstanceSampler
+            sampler = MinInstanceSampler(min_size=20)
+            
+            # Create dataloaders
+            train_loader = sam_training.default_sam_loader(
+                raw_paths=images_dir,
+                raw_key="train_*.tif",
+                label_paths=labels_dir,
+                label_key="train_*.tif",
+                with_segmentation_decoder=True,
+                patch_shape=(1, *patch_shape),
+                batch_size=batch_size,
+                shuffle=True,
+                sampler=sampler,
+                num_workers=4,
+                pin_memory=True,
+            )
+            
+            val_loader = sam_training.default_sam_loader(
+                raw_paths=images_dir,
+                raw_key="valid_*.tif",
+                label_paths=labels_dir,
+                label_key="valid_*.tif",
+                with_segmentation_decoder=True,
+                patch_shape=(1, *patch_shape),
+                batch_size=batch_size,
+                shuffle=False,
+                sampler=sampler,
+                num_workers=4,
+                pin_memory=True,
+            )
+            
+            # Check for cancellation
+            if self.fit_cancelled:
+                self.fit_error = "Training cancelled by user"
+                return
+            
+            # Configure training parameters
+            freeze_parts = ["image_encoder"] if freeze_encoder else None
+            scheduler_kwargs = {
+                "mode": "min",
+                "factor": 0.8,
+                "patience": scheduler_patience,
+                "min_lr": 1e-7,
+            }
+            
+            # Check for existing checkpoint to continue from
+            latest_checkpoint = os.path.join(self.checkpoint_dir, "latest.pt")
+            resume_from_checkpoint = latest_checkpoint if os.path.exists(latest_checkpoint) else None
+            
+            # Train the model
+            checkpoint_name = "bioengine_shared"
+            
+            sam_training.train_sam(
+                name=checkpoint_name,
+                save_root="models",
+                model_type=self.model_type,
+                train_loader=train_loader,
+                val_loader=val_loader,
+                n_epochs=n_epochs,
+                n_objects_per_batch=n_objects_per_batch,
+                with_segmentation_decoder=True,
+                freeze=freeze_parts,
+                device=self.device,
+                lr=learning_rate,
+                early_stopping=early_stopping,
+                scheduler_kwargs=scheduler_kwargs,
+                save_every_kth_epoch=10,
+                n_sub_iteration=6,
+                mask_prob=0.6,
+                checkpoint_path=resume_from_checkpoint,
+                overwrite_training=False,
+            )
+            
+            # Update current checkpoint
+            best_checkpoint = os.path.join(self.checkpoint_dir, "best.pt")
+            self.current_checkpoint = best_checkpoint
+            
+            self.fit_result = {
+                "status": "completed",
+                "checkpoint": best_checkpoint,
+                "epochs": n_epochs,
+                "message": "Training completed successfully"
+            }
+            
+        except Exception as e:
+            self.fit_error = f"Training failed: {str(e)}"
+        finally:
+            # Clean up temporary files
+            if 'temp_dir' in locals():
+                shutil.rmtree(temp_dir, ignore_errors=True)
 
     @schema_method
     async def start_fit(
         self,
+        images: List[np.ndarray] = Field(
+            ...,
+            description="List of training images as numpy arrays",
+        ),
+        annotations: Dict[str, Any] = Field(
+            ...,
+            description="COCO format annotations dictionary",
+        ),
         n_epochs: int = Field(
-            1,
+            50,
             description="Number of epochs to train",
         ),
         context: Dict[str, Any] = Field(
@@ -41,7 +369,18 @@ class MicroSamTrainer:
             description="Authentication context containing user information, automatically provided by Hypha during service calls.",
         ),
     ) -> Dict[str, str]:
-        self.fit_task = asyncio.create_task(self._fit_background(n_epochs=n_epochs))
+        import asyncio
+        
+        # Validate inputs
+        if not self._validate_coco_annotations(annotations):
+            return {"status": "error", "message": "Invalid COCO annotations format"}
+        
+        for i, image in enumerate(images):
+            if not self._validate_image_format(image):
+                return {"status": "error", "message": f"Invalid image format at index {i}. Expected (C, H, W) where C in [1, 3]"}
+        
+        # Start training task
+        self.fit_task = asyncio.create_task(self._fit_background(images, annotations, n_epochs))
         self.fit_result = None
         self.fit_error = None
 
@@ -121,7 +460,41 @@ class MicroSamTrainer:
             description="Authentication context containing user information, automatically provided by Hypha during service calls.",
         ),
     ) -> np.ndarray:
-        pass
+        # Validate input format
+        if not self._validate_image_format(image):
+            raise ValueError(f"Invalid image format. Expected (C, H, W) where C in [1, 3], got {image.shape}")
+        
+        # Load model if not already loaded
+        if self.predictor is None:
+            self._load_model()
+        
+        # Convert image to the format expected by SAM
+        if len(image.shape) == 3 and image.shape[0] in [1, 3]:
+            # Convert (C, H, W) to (H, W) for grayscale or (H, W, C) for RGB
+            if image.shape[0] == 1:
+                image_2d = image[0]  # (H, W)
+            else:
+                image_2d = np.transpose(image, (1, 2, 0))  # (H, W, C)
+        else:
+            image_2d = image  # Assume already (H, W)
+        
+        # Set image in predictor to compute embeddings
+        self.predictor.set_image(image_2d)
+        
+        # Extract embeddings from predictor's internal state
+        # The predictor stores the image features internally
+        # We need to access the features that were computed
+        if hasattr(self.predictor, 'features') and self.predictor.features is not None:
+            # Extract the image features (embeddings)
+            features = self.predictor.features
+            if hasattr(features, 'cpu'):
+                features = features.cpu().numpy()
+            
+            # Flatten to 1D array
+            embedding = features.flatten()
+            return embedding
+        else:
+            raise RuntimeError("Failed to extract embeddings from predictor")
 
     @schema_method
     async def download_mask_decoder(
@@ -131,7 +504,40 @@ class MicroSamTrainer:
             description="Authentication context containing user information, automatically provided by Hypha during service calls.",
         ),
     ) -> bytes:
-        pass
+        import torch
+        import io
+        
+        # Load model if not already loaded
+        if self.predictor is None or self.segmenter is None:
+            self._load_model()
+        
+        # Get the current checkpoint path
+        checkpoint_path = self.current_checkpoint
+        if checkpoint_path is None:
+            # Use pre-trained model
+            from micro_sam.util import get_sam_model
+            model = get_sam_model(model_type=self.model_type, device=self.device)
+        else:
+            # Load fine-tuned model
+            checkpoint = torch.load(checkpoint_path, map_location=self.device)
+            from micro_sam.util import get_sam_model
+            model = get_sam_model(model_type=self.model_type, device=self.device)
+            model.load_state_dict(checkpoint["model_state"])
+        
+        # Extract mask decoder state dict
+        mask_decoder_state = {}
+        for name, param in model.mask_decoder.named_parameters():
+            mask_decoder_state[name] = param.cpu()
+        
+        for name, buffer in model.mask_decoder.named_buffers():
+            mask_decoder_state[name] = buffer.cpu()
+        
+        # Serialize to bytes
+        buffer = io.BytesIO()
+        torch.save(mask_decoder_state, buffer)
+        buffer.seek(0)
+        
+        return buffer.getvalue()
 
     @schema_method(arbitrary_types_allowed=True)  # needed for numpy array
     async def segment_all(
@@ -149,7 +555,48 @@ class MicroSamTrainer:
             description="Authentication context containing user information, automatically provided by Hypha during service calls.",
         ),
     ) -> np.ndarray:
-        pass
+        from micro_sam.automatic_segmentation import automatic_instance_segmentation
+        
+        # Input validation
+        if embedding:
+            # For embeddings, expect 1D array
+            if len(image_or_embedding.shape) != 1:
+                raise ValueError(f"Expected 1D embedding array, got shape {image_or_embedding.shape}")
+        else:
+            # For images, validate format
+            if not self._validate_image_format(image_or_embedding):
+                raise ValueError(f"Invalid image format. Expected (C, H, W) where C in [1, 3], got {image_or_embedding.shape}")
+        
+        # Load model if not already loaded
+        if self.predictor is None or self.segmenter is None:
+            self._load_model()
+        
+        # Run automatic instance segmentation
+        if embedding:
+            # For embeddings, we need to handle this differently
+            # This is a simplified approach - in practice, you might need to reconstruct the image
+            # or use the embedding directly with the segmenter
+            raise NotImplementedError("Embedding-based segmentation not yet implemented")
+        else:
+            # Convert image to the format expected by microSAM
+            if len(image_or_embedding.shape) == 3 and image_or_embedding.shape[0] in [1, 3]:
+                # Convert (C, H, W) to (H, W) for grayscale or (H, W, C) for RGB
+                if image_or_embedding.shape[0] == 1:
+                    image_2d = image_or_embedding[0]  # (H, W)
+                else:
+                    image_2d = np.transpose(image_or_embedding, (1, 2, 0))  # (H, W, C)
+            else:
+                image_2d = image_or_embedding  # Assume already (H, W)
+            
+            # Run segmentation
+            prediction = automatic_instance_segmentation(
+                predictor=self.predictor,
+                segmenter=self.segmenter,
+                input_path=image_2d,
+                ndim=2,
+            )
+            
+            return prediction
 
 
 if __name__ == "__main__":
