@@ -2,7 +2,6 @@
 
 # Data directories
 data/
-*.json
 *.pkl
 *.h5
 *.hdf5
