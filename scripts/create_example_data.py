@@ -13,8 +13,8 @@ import shutil
 
 
 def create_simple_finetuning_example():
-    """Create simple fine-tuning example with one image and one JSON."""
-    print("🔧 Creating simple fine-tuning example...")
+    """Create simple fine-tuning example with 4 images and annotations for proper train/val split."""
+    print("🔧 Creating simple fine-tuning example with 4 images...")
     
     # Create output directory
     output_dir = Path("examples/simple_finetuning")
@@ -25,17 +25,35 @@ def create_simple_finetuning_example():
     with open(train_ann_path, 'r') as f:
         train_data = json.load(f)
     
-    # Take just the first image
-    sample_image = train_data['images'][0]
-    sample_image_id = sample_image['id']
+    # Select 4 images with good annotation coverage
+    # Filter images that have annotations
+    images_with_annotations = []
+    for img in train_data['images']:
+        img_annotations = [ann for ann in train_data['annotations'] if ann['image_id'] == img['id']]
+        if len(img_annotations) > 0:  # Only include images with annotations
+            images_with_annotations.append((img, img_annotations))
     
-    # Get annotations for this image
-    sample_annotations = [ann for ann in train_data['annotations'] if ann['image_id'] == sample_image_id]
+    # Sort by number of annotations (descending) and take top 4
+    images_with_annotations.sort(key=lambda x: len(x[1]), reverse=True)
+    selected_images_data = images_with_annotations[:4]
     
-    # Create simple COCO format with just one image
+    print(f"  📊 Selected 4 images from {len(images_with_annotations)} available images")
+    
+    # Extract selected images and all their annotations
+    selected_images = []
+    selected_annotations = []
+    all_annotations = []
+    
+    for i, (img, img_annotations) in enumerate(selected_images_data):
+        selected_images.append(img)
+        selected_annotations.extend(img_annotations)
+        all_annotations.extend(img_annotations)
+        print(f"    Image {i+1}: {img['file_name']} ({len(img_annotations)} annotations)")
+    
+    # Create COCO format with 4 images
     simple_coco = {
-        "images": [sample_image],
-        "annotations": sample_annotations,
+        "images": selected_images,
+        "annotations": all_annotations,
         "categories": train_data['categories']
     }
     
@@ -43,31 +61,46 @@ def create_simple_finetuning_example():
     with open(output_dir / "annotations.json", 'w') as f:
         json.dump(simple_coco, f, indent=2)
     
-    # Copy the image
-    src_path = Path("data/Revvity-25/images") / sample_image['file_name']
-    dst_path = output_dir / sample_image['file_name']
-    if src_path.exists():
-        shutil.copy2(src_path, dst_path)
-        print(f"  ✅ Copied {sample_image['file_name']}")
+    # Copy all selected images
+    copied_images = []
+    for i, (img, _) in enumerate(selected_images_data):
+        src_path = Path("data/Revvity-25/images") / img['file_name']
+        dst_path = output_dir / img['file_name']
+        if src_path.exists():
+            shutil.copy2(src_path, dst_path)
+            copied_images.append(img['file_name'])
+            print(f"  ✅ Copied {img['file_name']}")
     
-    # Create numpy array for bioengine-app
-    if src_path.exists():
-        # Load image and convert to numpy array
-        img = cv2.imread(str(src_path))
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        # Convert to (C, H, W) format
-        img_array = np.transpose(img, (2, 0, 1))
-        
-        # Save as numpy array
-        np.save(output_dir / "image.npy", img_array)
-        print(f"  ✅ Created image.npy")
+    # Create numpy arrays for bioengine-app (all 4 images)
+    image_arrays = []
+    for i, (img, _) in enumerate(selected_images_data):
+        src_path = Path("data/Revvity-25/images") / img['file_name']
+        if src_path.exists():
+            # Load image and convert to numpy array
+            img_cv = cv2.imread(str(src_path))
+            img_cv = cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB)
+            # Convert to (C, H, W) format
+            img_array = np.transpose(img_cv, (2, 0, 1))
+            image_arrays.append(img_array)
+    
+    # Save all images as numpy arrays
+    for i, img_array in enumerate(image_arrays):
+        np.save(output_dir / f"image_{i}.npy", img_array)
+        print(f"  ✅ Created image_{i}.npy")
+    
+    # Also create a combined array for backward compatibility
+    if image_arrays:
+        # Use the first image as the main one for backward compatibility
+        np.save(output_dir / "image.npy", image_arrays[0])
+        print(f"  ✅ Created image.npy (main image)")
     
     print(f"✅ Simple fine-tuning example created in {output_dir}")
-    print(f"   Image: {sample_image['file_name']}")
-    print(f"   Annotations: {len(sample_annotations)} cells")
-    print(f"   Files: annotations.json, image.npy, {sample_image['file_name']}")
+    print(f"   Images: {len(selected_images)} images")
+    print(f"   Annotations: {len(all_annotations)} total cells")
+    print(f"   Files: annotations.json, image.npy, image_0.npy, image_1.npy, image_2.npy, image_3.npy")
+    print(f"   Copied images: {', '.join(copied_images)}")
     
-    return output_dir, simple_coco, img_array
+    return output_dir, simple_coco, image_arrays
 
 
 def create_simple_segmentation_example():
@@ -143,7 +176,7 @@ def main():
     Path("examples").mkdir(exist_ok=True)
     
     # Create simple fine-tuning example
-    finetuning_dir, coco_data, image_array = create_simple_finetuning_example()
+    finetuning_dir, coco_data, image_arrays = create_simple_finetuning_example()
     
     # Create simple segmentation example
     segmentation_dir = create_simple_segmentation_example()
@@ -154,13 +187,15 @@ def main():
     
     # Print summary
     print(f"\n📊 Summary:")
-    print(f"   Fine-tuning: 1 image, {len(coco_data['annotations'])} annotations")
+    print(f"   Fine-tuning: {len(coco_data['images'])} images, {len(coco_data['annotations'])} annotations")
     print(f"   Segmentation: 1 test image + ground truth")
+    print(f"   Train/Val split: {len(coco_data['images'])} images → 80/20 split")
     
     print(f"\n🎯 Usage:")
     print(f"   1. Fine-tuning: Use examples/simple_finetuning/ with start_fit()")
     print(f"   2. Segmentation: Use examples/simple_segmentation/ with segment_all()")
     print(f"   3. See examples/simple_*.py for code examples")
+    print(f"   4. Training now supports proper train/validation split!")
 
 
 if __name__ == "__main__":
