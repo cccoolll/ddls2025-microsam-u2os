@@ -31,7 +31,9 @@ class MicroSamTrainer:
         self.device = "cuda" if self._check_cuda() else "cpu"
         # Initialize checkpoint directory
         import os
-        self.checkpoint_dir = os.path.abspath("models/checkpoints")
+        # Use absolute path to project's checkpoint directory
+        # Since __file__ is not available in Ray Serve context, use a hardcoded path
+        self.checkpoint_dir = "/home/scheng/workspace/ddls2025-microsam-u2os/models/checkpoints"
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         self.current_checkpoint = None
     
