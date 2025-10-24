@@ -2,19 +2,21 @@ from typing import Any, Dict, List
 
 import numpy as np
 from hypha_rpc.utils.schema import schema_method
-from pydantic import Field
+from pydantic import Field, BaseModel, ConfigDict
 from ray import serve
 
 
 @serve.deployment(
     ray_actor_options={
-        "num_cpus": 1,
-        "num_gpus": 1,
-        "memory": 16 * 1024 * 1024 * 1024,  # 16GB RAM limit
-        "runtime_env": {"conda": ["microsam"]},  # Name of conda environment
+        "num_cpus": 4,
+        "num_gpus": 2,  # Request 1 GPU for training
+        "memory": 8 * 1024 * 1024 * 1024,  # 8GB RAM for RTX 3090
+        # "runtime_env": {"conda": ["microsam"]},  # Already running in the conda environment in terminal
     },
 )
 class MicroSamTrainer:
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    
     def __init__(self):
         # Training state
         self.fit_task = None
@@ -27,12 +29,11 @@ class MicroSamTrainer:
         self.segmenter = None
         self.model_type = "vit_b_lm"
         self.device = "cuda" if self._check_cuda() else "cpu"
-        self.checkpoint_dir = "models/checkpoints"
-        self.current_checkpoint = None
-        
         # Initialize checkpoint directory
         import os
+        self.checkpoint_dir = os.path.abspath("models/checkpoints")
         os.makedirs(self.checkpoint_dir, exist_ok=True)
+        self.current_checkpoint = None
     
     def _check_cuda(self):
         """Check CUDA availability without importing torch at module level."""
@@ -202,6 +203,13 @@ class MicroSamTrainer:
         # Reset cancellation flag
         self.fit_cancelled = False
         
+        # Enforce minimum 2 images requirement
+        if len(images) < 2:
+            raise ValueError(
+                f"Minimum 2 images required for proper train/validation split. "
+                f"Received {len(images)} image(s)."
+            )
+        
         try:
             # Create temporary directory for training data
             temp_dir = tempfile.mkdtemp(prefix="microsam_training_")
@@ -249,8 +257,8 @@ class MicroSamTrainer:
                 return
             
             # Training configuration (hardcoded from training scripts)
-            batch_size = 2
-            n_objects_per_batch = 8
+            batch_size = 1  # Reduced for memory efficiency
+            n_objects_per_batch = 4  # Reduced for memory efficiency
             patch_shape = (512, 512)
             learning_rate = 1e-4
             freeze_encoder = True
@@ -352,7 +360,7 @@ class MicroSamTrainer:
     @schema_method
     async def start_fit(
         self,
-        images: List[np.ndarray] = Field(
+        images: List[Any] = Field(
             ...,
             description="List of training images as numpy arrays",
         ),
@@ -448,10 +456,10 @@ class MicroSamTrainer:
 
         return {"status": "cancelled", "message": "Fit task has been cancelled."}
 
-    @schema_method(arbitrary_types_allowed=True)  # needed for numpy array
+    @schema_method
     async def encode_image(
         self,
-        image: np.ndarray = Field(
+        image: Any = Field(
             ...,
             description="Input data as numpy array of shape (C, H, W)",
         ),
@@ -459,7 +467,7 @@ class MicroSamTrainer:
             ...,
             description="Authentication context containing user information, automatically provided by Hypha during service calls.",
         ),
-    ) -> np.ndarray:
+    ) -> Any:
         # Validate input format
         if not self._validate_image_format(image):
             raise ValueError(f"Invalid image format. Expected (C, H, W) where C in [1, 3], got {image.shape}")
@@ -539,10 +547,10 @@ class MicroSamTrainer:
         
         return buffer.getvalue()
 
-    @schema_method(arbitrary_types_allowed=True)  # needed for numpy array
+    @schema_method
     async def segment_all(
         self,
-        image_or_embedding: np.ndarray = Field(
+        image_or_embedding: Any = Field(
             ...,
             description="Input data as numpy array of shape (C, H, W) if image, or (D,) if embedding.",
         ),
@@ -554,7 +562,7 @@ class MicroSamTrainer:
             ...,
             description="Authentication context containing user information, automatically provided by Hypha during service calls.",
         ),
-    ) -> np.ndarray:
+    ) -> Any:
         from micro_sam.automatic_segmentation import automatic_instance_segmentation
         
         # Input validation
