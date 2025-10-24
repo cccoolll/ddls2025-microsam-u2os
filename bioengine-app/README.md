@@ -12,6 +12,7 @@ python -m bioengine.worker \
     --mode single-machine \
     --head_num_gpus 2 \ #Use
     --head_num_cpus 4
+    --workspace agent-lens
 ```
 
 This will start a local Ray cluster and register a Hypha service. Note the workspace URL and service ID from the output.

@@ -3,16 +3,21 @@
 Auto-segmentation of microscopy images using deployed microSAM service.
 """
 import asyncio
+import os
 import numpy as np
 import imageio.v3 as imageio
+from dotenv import load_dotenv
 from hypha_rpc import connect_to_server, login
 
 async def auto_segment_image():
     print("🔬 Auto-segmentation of microscopy images using microSAM")
     
+    # Load .env file if it exists
+    load_dotenv()
+    
     # Connect to Hypha server
     print("Connecting to Hypha server...")
-    token = await login({"server_url": "https://hypha.aicell.io"})
+    token = os.getenv("HYPHA_TOKEN") or await login({"server_url": "https://hypha.aicell.io"})
     server = await connect_to_server({
         "server_url": "https://hypha.aicell.io",
         "token": token,
@@ -36,34 +41,14 @@ async def auto_segment_image():
     
     print(f"Converted image shape: {image_array.shape}")
     
-    # Find the microSAM service
-    print("Finding microSAM service...")
-    all_services = await server.list_services()
-    
-    microsam_service = None
-    for service_info in all_services:
-        if isinstance(service_info, dict):
-            service_id = service_info.get('id', service_info.get('name', str(service_info)))
-        else:
-            service_id = str(service_info)
-        
-        # Skip obvious non-microSAM services
-        if any(skip_term in service_id.lower() for skip_term in ['rtc', 'built-in', 'webrtc', 'proxy']):
-            continue
-            
-        try:
-            print(f"Testing service: {service_id}")
-            test_service = await server.get_service(service_id)
-            await test_service.get_fit_status()
-            microsam_service = test_service
-            print(f"✅ Found microSAM service: {service_id}")
-            break
-        except Exception as e:
-            print(f"  Not microSAM service: {str(e)[:50]}...")
-            continue
-    
-    if microsam_service is None:
-        print("❌ Could not find microSAM service")
+    # Connect directly to the micro-sam application
+    print("Connecting to microSAM service...")
+    try:
+        # Try to connect directly to the micro-sam application
+        microsam_service = await server.get_service("agent-lens/micro-sam")
+        print("✅ Connected to microSAM service: agent-lens/micro-sam")
+    except Exception as e:
+        print(f"❌ Could not connect to microSAM service: {e}")
         return
     
     # Perform auto-segmentation
