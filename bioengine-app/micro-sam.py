@@ -560,6 +560,14 @@ class MicroSamTrainer:
             False,
             description="If True, the input is treated as an embedding; otherwise, as an image.",
         ),
+        tile_shape: Any = Field(
+            None,
+            description="Tile shape for large images (e.g., (1024, 1024)). None for auto-detection.",
+        ),
+        halo: Any = Field(
+            None,
+            description="Tile overlap for large images (e.g., (256, 256)). None for auto-detection.",
+        ),
         context: Dict[str, Any] = Field(
             ...,
             description="Authentication context containing user information, automatically provided by Hypha during service calls.",
@@ -598,13 +606,29 @@ class MicroSamTrainer:
             else:
                 image_2d = image_or_embedding  # Assume already (H, W)
             
+            # Auto-detect if tiling is needed for large images
+            if tile_shape is None and halo is None:
+                if image_2d.shape[0] > 2048 or image_2d.shape[1] > 2048:
+                    # Large image - enable tiling
+                    tile_shape = (1024, 1024)
+                    halo = (256, 256)
+            
+            # Prepare kwargs for segmentation
+            kwargs = {
+                "predictor": self.predictor,
+                "segmenter": self.segmenter,
+                "input_path": image_2d,
+                "ndim": 2,
+            }
+            
+            # Add tiling parameters if provided
+            if tile_shape is not None and halo is not None:
+                kwargs["tile_shape"] = tile_shape
+                kwargs["halo"] = halo
+                kwargs["batch_size"] = 4  # Process tiles in batches for efficiency
+            
             # Run segmentation
-            prediction = automatic_instance_segmentation(
-                predictor=self.predictor,
-                segmenter=self.segmenter,
-                input_path=image_2d,
-                ndim=2,
-            )
+            prediction = automatic_instance_segmentation(**kwargs)
             
             return prediction
 
