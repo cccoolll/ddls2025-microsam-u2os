@@ -9,7 +9,7 @@ from ray import serve
 @serve.deployment(
     ray_actor_options={
         "num_cpus": 4,
-        "num_gpus": 2,  # Request 1 GPU for training
+        "num_gpus": 2,  # Request 2 GPUs for training
         "memory": 8 * 1024 * 1024 * 1024,  # 8GB RAM for RTX 3090
         # "runtime_env": {"conda": ["microsam"]},  # Already running in the conda environment in terminal
     },
