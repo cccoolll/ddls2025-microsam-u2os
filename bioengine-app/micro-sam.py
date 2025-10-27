@@ -10,7 +10,7 @@ from ray import serve
     ray_actor_options={
         "num_cpus": 4,
         "num_gpus": 2,  # Request 2 GPUs for training
-        "memory": 8 * 1024 * 1024 * 1024,  # 8GB RAM for RTX 3090
+        "memory": 12 * 1024 * 1024 * 1024,
         # "runtime_env": {"conda": ["microsam"]},  # Already running in the conda environment in terminal
     },
 )
@@ -194,23 +194,14 @@ class MicroSamTrainer:
         
         return self.predictor, self.segmenter
 
-    async def _fit_background(self, images: List[np.ndarray], annotations: dict, n_epochs: int):
+    def _fit_blocking(self, images: List[np.ndarray], annotations: dict, n_epochs: int):
+        """Blocking training function to run in a thread."""
         import torch
         import os
         import tempfile
         import shutil
         import micro_sam.training as sam_training
         from torch_em.data import MinInstanceSampler
-
-        # Reset cancellation flag
-        self.fit_cancelled = False
-        
-        # Enforce minimum 2 images requirement
-        if len(images) < 2:
-            raise ValueError(
-                f"Minimum 2 images required for proper train/validation split. "
-                f"Received {len(images)} image(s)."
-            )
         
         try:
             # Create temporary directory for training data
@@ -358,6 +349,27 @@ class MicroSamTrainer:
             # Clean up temporary files
             if 'temp_dir' in locals():
                 shutil.rmtree(temp_dir, ignore_errors=True)
+    
+    async def _fit_background(self, images: List[np.ndarray], annotations: dict, n_epochs: int):
+        """Async wrapper that runs blocking training in a thread."""
+        import asyncio
+        
+        # Reset cancellation flag
+        self.fit_cancelled = False
+        
+        # Enforce minimum 2 images requirement
+        if len(images) < 2:
+            raise ValueError(
+                f"Minimum 2 images required for proper train/validation split. "
+                f"Received {len(images)} image(s)."
+            )
+        
+        # Run blocking training in a thread pool to avoid blocking the event loop
+        # This allows health checks to continue responding
+        try:
+            await asyncio.to_thread(self._fit_blocking, images, annotations, n_epochs)
+        except Exception as e:
+            self.fit_error = f"Training failed: {str(e)}"
 
     @schema_method
     async def start_fit(
@@ -373,10 +385,6 @@ class MicroSamTrainer:
         n_epochs: int = Field(
             50,
             description="Number of epochs to train",
-        ),
-        context: Dict[str, Any] = Field(
-            ...,
-            description="Authentication context containing user information, automatically provided by Hypha during service calls.",
         ),
     ) -> Dict[str, str]:
         import asyncio
@@ -399,10 +407,6 @@ class MicroSamTrainer:
     @schema_method
     async def get_fit_status(
         self,
-        context: Dict[str, Any] = Field(
-            ...,
-            description="Authentication context containing user information, automatically provided by Hypha during service calls.",
-        ),
     ) -> Dict[str, str]:
         if self.fit_task is None:
             return {
@@ -423,10 +427,6 @@ class MicroSamTrainer:
     @schema_method
     async def cancel_fit(
         self,
-        context: Dict[str, Any] = Field(
-            ...,
-            description="Authentication context containing user information, automatically provided by Hypha during service calls.",
-        ),
     ) -> Dict[str, str]:
         if self.fit_task is None:
             return {
@@ -464,10 +464,6 @@ class MicroSamTrainer:
         image: Any = Field(
             ...,
             description="Input data as numpy array of shape (C, H, W)",
-        ),
-        context: Dict[str, Any] = Field(
-            ...,
-            description="Authentication context containing user information, automatically provided by Hypha during service calls.",
         ),
     ) -> Any:
         # Validate input format
@@ -509,10 +505,6 @@ class MicroSamTrainer:
     @schema_method
     async def download_mask_decoder(
         self,
-        context: Dict[str, Any] = Field(
-            ...,
-            description="Authentication context containing user information, automatically provided by Hypha during service calls.",
-        ),
     ) -> bytes:
         import torch
         import io
@@ -567,10 +559,6 @@ class MicroSamTrainer:
         halo: Any = Field(
             None,
             description="Tile overlap for large images (e.g., (256, 256)). None for auto-detection.",
-        ),
-        context: Dict[str, Any] = Field(
-            ...,
-            description="Authentication context containing user information, automatically provided by Hypha during service calls.",
         ),
     ) -> Any:
         from micro_sam.automatic_segmentation import automatic_instance_segmentation

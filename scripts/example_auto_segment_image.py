@@ -8,7 +8,7 @@ import time
 import numpy as np
 import imageio.v3 as imageio
 from dotenv import load_dotenv
-from hypha_rpc import connect_to_server, login, get_rtc_service
+from hypha_rpc import connect_to_server, login
 
 async def auto_segment_image():
     print("🔬 Auto-segmentation of microscopy images using microSAM")
@@ -24,23 +24,19 @@ async def auto_segment_image():
         "token": token,
     })
     
-    # Try WebRTC connection for low-latency communication
-    print("🌐 Attempting WebRTC connection for low-latency communication...")
+    # Connect directly to microSAM service via HTTP
+    # Note: WebRTC has known issues with context parameter handling in hypha_rpc
+    print("🌐 Connecting to microSAM service...")
+    use_webrtc = False
+    
     try:
-        # Get WebRTC service for peer-to-peer communication
-        webrtc_service_id = "agent-lens"  # The workspace where microSAM is running
-        peer_connection = await get_rtc_service(server, webrtc_service_id)
-        print(f"✅ WebRTC peer connection established with: {webrtc_service_id}")
-        
-        # Connect to microSAM service via WebRTC
-        microsam_service = await peer_connection.get_service("micro-sam")
-        print("✅ Connected to microSAM service via WebRTC!")
-        use_webrtc = True
+        # Connect directly to the micro-sam service
+        microsam_service = await server.get_service("agent-lens/micro-sam")
+        print("✅ Connected to microSAM service: agent-lens/micro-sam")
         
     except Exception as e:
-        print(f"⚠️ WebRTC connection failed: {e}")
-        print("🔄 Falling back to regular HTTP connection...")
-        use_webrtc = False
+        print(f"❌ Could not connect to microSAM service: {e}")
+        return
     
     # Load the test image
     print("Loading test image...")
@@ -60,20 +56,8 @@ async def auto_segment_image():
     
     print(f"Converted image shape: {image_array.shape}")
     
-    # Connect to microSAM service (fallback to HTTP if WebRTC failed)
-    if not use_webrtc:
-        print("Connecting to microSAM service via HTTP...")
-        try:
-            # Try to connect directly to the micro-sam application
-            microsam_service = await server.get_service("agent-lens/micro-sam")
-            print("✅ Connected to microSAM service: agent-lens/micro-sam")
-        except Exception as e:
-            print(f"❌ Could not connect to microSAM service: {e}")
-            return
-    
     # Perform auto-segmentation with timing
-    connection_type = "WebRTC" if use_webrtc else "HTTP"
-    print(f"🎯 Performing auto-segmentation via {connection_type}...")
+    print(f"🎯 Performing auto-segmentation...")
     
     start_time = time.time()
     try:
@@ -85,7 +69,7 @@ async def auto_segment_image():
         end_time = time.time()
         processing_time = end_time - start_time
         
-        print(f"✅ Auto-segmentation completed via {connection_type}!")
+        print(f"✅ Auto-segmentation completed!")
         print(f"⏱️ Processing time: {processing_time:.2f} seconds")
         print(f"Segmentation result type: {type(segmentation_result)}")
         
@@ -114,11 +98,7 @@ async def auto_segment_image():
         print(f"❌ Segmentation failed: {e}")
         return
     
-    print(f"🎉 Auto-segmentation completed successfully via {connection_type}!")
-    if use_webrtc:
-        print("🌐 WebRTC provided low-latency peer-to-peer communication!")
-    else:
-        print("🌍 HTTP fallback was used for communication.")
+    print(f"🎉 Auto-segmentation completed successfully!")
 
 if __name__ == "__main__":
     asyncio.run(auto_segment_image())
