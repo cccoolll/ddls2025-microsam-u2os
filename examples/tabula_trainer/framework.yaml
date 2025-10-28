@@ -1,0 +1,32 @@
+Pretrain:
+  params:
+    env.per_gpu_batch_size: 32                  # the size of batch in local client
+    env.per_gpu_num_work: 0                     # the number of workers in local client dataloader - temporarily set to 0, before 4
+    env.per_gpu_epoch: 1                        # the epoch of training in local client
+    pretrainer.backbone: "FlashAttention"       # the type of attention, "FTT" or "Saint-V" or "FastFormer" or "FlashAttention"
+    pretrainer.augmentation_type: "corruption"  # the type of augmentation, "corruption" or "identical"
+    pretrainer.corruption_rate: 0.6             # the rate of corruption in each cell
+    pretrainer.objective: "both"                # the pretrain task, "both", "contrastive", "reconstruction"
+    pretrainer.contrastive_scale: 1.0           # the scale of contrastive loss
+    pretrainer.reconstruction_scale: 0.03       # the scale of reconstruction loss 
+    pretrainer.temperature: 0.07                # the tempature of contrastive loss
+    pretrainer.learning_rate: 0.0001
+    checkpoint_path: "./output/"                # the path of checkpoint
+
+Model:
+  padding_id: 60694     # the <pad> id in vocab
+  padding_value: 0.0    # the value at the position <pad>
+  in_feature: 1200            # the fixed length of the gene values sequence
+  embedding_in_feature: 60697 # the size of vocab
+  d_token: 192                # the hidden dimension of encoding
+  contrastive_out_feature: 128      # the feature dimension of contrastive loss
+  n_blocks: 3                       # the number of the attention block
+  attention_n_heads: 8              # the number of the attention head
+  attention_dropout: 0.2            # the dropout rate of attention
+  ffn_d_hidden: 192                 # the dimension of feedforward
+  ffn_dropout: 0.1                  # the dropout rate of feedforward
+  residual_dropout: 0.0             # the dropout rate of residual
+  cls: True                         # whether append cls
+  pre_normalization: True           # whether normalization before residual
+  global_token: True                # whether use global token
+  seed: 0                           # model initial seed

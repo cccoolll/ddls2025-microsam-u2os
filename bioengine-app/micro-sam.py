@@ -374,10 +374,6 @@ class MicroSamTrainer:
             50,
             description="Number of epochs to train",
         ),
-        context: Dict[str, Any] = Field(
-            ...,
-            description="Authentication context containing user information, automatically provided by Hypha during service calls.",
-        ),
     ) -> Dict[str, str]:
         import asyncio
         
@@ -399,10 +395,6 @@ class MicroSamTrainer:
     @schema_method
     async def get_fit_status(
         self,
-        context: Dict[str, Any] = Field(
-            ...,
-            description="Authentication context containing user information, automatically provided by Hypha during service calls.",
-        ),
     ) -> Dict[str, str]:
         if self.fit_task is None:
             return {
@@ -423,10 +415,6 @@ class MicroSamTrainer:
     @schema_method
     async def cancel_fit(
         self,
-        context: Dict[str, Any] = Field(
-            ...,
-            description="Authentication context containing user information, automatically provided by Hypha during service calls.",
-        ),
     ) -> Dict[str, str]:
         if self.fit_task is None:
             return {
@@ -464,10 +452,6 @@ class MicroSamTrainer:
         image: Any = Field(
             ...,
             description="Input data as numpy array of shape (C, H, W)",
-        ),
-        context: Dict[str, Any] = Field(
-            ...,
-            description="Authentication context containing user information, automatically provided by Hypha during service calls.",
         ),
     ) -> Any:
         # Validate input format
@@ -509,10 +493,6 @@ class MicroSamTrainer:
     @schema_method
     async def download_mask_decoder(
         self,
-        context: Dict[str, Any] = Field(
-            ...,
-            description="Authentication context containing user information, automatically provided by Hypha during service calls.",
-        ),
     ) -> bytes:
         import torch
         import io
@@ -567,10 +547,6 @@ class MicroSamTrainer:
         halo: Any = Field(
             None,
             description="Tile overlap for large images (e.g., (256, 256)). None for auto-detection.",
-        ),
-        context: Dict[str, Any] = Field(
-            ...,
-            description="Authentication context containing user information, automatically provided by Hypha during service calls.",
         ),
     ) -> Any:
         from micro_sam.automatic_segmentation import automatic_instance_segmentation

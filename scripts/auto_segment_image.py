@@ -24,17 +24,29 @@ async def auto_segment_image():
         "token": token,
     })
     
+    # Get the BioEngine worker to check application status
+    bioengine_worker = await server.get_service("agent-lens/bioengine-worker")
+    
     # Try WebRTC connection for low-latency communication
     print("🌐 Attempting WebRTC connection for low-latency communication...")
     try:
-        # Get WebRTC service for peer-to-peer communication
-        webrtc_service_id = "agent-lens"  # The workspace where microSAM is running
-        peer_connection = await get_rtc_service(server, webrtc_service_id)
-        print(f"✅ WebRTC peer connection established with: {webrtc_service_id}")
+        # Get application status to retrieve the WebRTC service ID
+        app_status = await bioengine_worker.get_application_status(["micro-sam"])
+        service_ids = app_status["service_ids"][0]
+        WEBRTC_SERVICE_ID = service_ids["webrtc_service_id"]
+        print(f"🔍 WebRTC Service ID: {WEBRTC_SERVICE_ID}")
+        print(f"🔍 Service IDs structure: {service_ids}")
+        
+        # Connect via WebRTC without config parameter (like TabulaTrainer)
+        peer_connection = await get_rtc_service(server, WEBRTC_SERVICE_ID)
+        print(f"✅ WebRTC peer connection established with: {WEBRTC_SERVICE_ID}")
         
         # Connect to microSAM service via WebRTC
         microsam_service = await peer_connection.get_service("micro-sam")
         print("✅ Connected to microSAM service via WebRTC!")
+        print(f"🔍 WebRTC service type: {type(microsam_service)}")
+        print(f"🔍 WebRTC service methods: {[method for method in dir(microsam_service) if not method.startswith('_')]}")
+        
         use_webrtc = True
         
     except Exception as e:
@@ -77,10 +89,21 @@ async def auto_segment_image():
     
     start_time = time.time()
     try:
+        # Debug: Print service information
+        print(f"🔍 Service type: {type(microsam_service)}")
+        print(f"🔍 Service methods: {[method for method in dir(microsam_service) if not method.startswith('_')]}")
+        
         # Use the segment_all method for zero-prompt auto-segmentation
+        print("🎯 Calling segment_all method...")
+        print(f"🔍 About to call segment_all with context: {server.config}")
+        print(f"🔍 Context type: {type(server.config)}")
+        print(f"🔍 Context keys: {list(server.config.keys()) if hasattr(server.config, 'keys') else 'No keys method'}")
+        
+        # Call segment_all method with context as keyword argument
         segmentation_result = await microsam_service.segment_all(
             image_or_embedding=image_array,
-            embedding=False
+            embedding=False,
+            context=server.config
         )
         end_time = time.time()
         processing_time = end_time - start_time
@@ -112,6 +135,20 @@ async def auto_segment_image():
         
     except Exception as e:
         print(f"❌ Segmentation failed: {e}")
+        print(f"❌ Error type: {type(e)}")
+        print(f"❌ Error details: {str(e)}")
+        
+        # Check if this is the context error
+        if "Context is required" in str(e):
+            print("🚨 DIAGNOSIS: WebRTC Context Issue Detected!")
+            print("🔍 The problem is that WebRTC connections in bioengine don't properly pass context parameters.")
+            print("🔍 This is a known issue with bioengine's WebRTC implementation.")
+            print("💡 SOLUTION: Use WebSocket or HTTP connections instead of WebRTC for methods that require context.")
+            print("💡 The TabulaTrainer uses WebSocket for context-requiring methods and WebRTC for others.")
+        
+        import traceback
+        print(f"❌ Full traceback:")
+        traceback.print_exc()
         return
     
     print(f"🎉 Auto-segmentation completed successfully via {connection_type}!")
