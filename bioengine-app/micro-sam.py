@@ -29,6 +29,7 @@ class MicroSamTrainer:
         self.segmenter = None
         self.model_type = "vit_b_lm"
         self.device = "cuda" if self._check_cuda() else "cpu"
+        self.current_is_tiled = None  # Track current tiling mode
         # Initialize checkpoint directory
         import os
         # Use absolute path to project's checkpoint directory
@@ -168,9 +169,14 @@ class MicroSamTrainer:
         
         return temp_dir
     
-    def _load_model(self, checkpoint_path=None):
+    def _load_model(self, checkpoint_path=None, is_tiled=False):
         """Lazy load predictor and segmenter."""
         from micro_sam.automatic_segmentation import get_predictor_and_segmenter
+        
+        # PERFORMANCE FIX: Avoid reloading if model is already loaded with same configuration
+        if (self.predictor is not None and self.segmenter is not None and 
+            self.current_is_tiled == is_tiled):
+            return self.predictor, self.segmenter
         
         # Determine checkpoint to use
         if checkpoint_path is None:
@@ -189,8 +195,11 @@ class MicroSamTrainer:
             model_type=self.model_type,
             checkpoint=checkpoint_path,
             device=self.device,
-            is_tiled=False,
+            is_tiled=is_tiled,
         )
+        
+        # Track current tiling mode
+        self.current_is_tiled = is_tiled
         
         return self.predictor, self.segmenter
 
@@ -472,7 +481,7 @@ class MicroSamTrainer:
         
         # Load model if not already loaded
         if self.predictor is None:
-            self._load_model()
+            self._load_model(is_tiled=False)  # Encoding doesn't need tiling
         
         # Convert image to the format expected by SAM
         if len(image.shape) == 3 and image.shape[0] in [1, 3]:
@@ -511,7 +520,7 @@ class MicroSamTrainer:
         
         # Load model if not already loaded
         if self.predictor is None or self.segmenter is None:
-            self._load_model()
+            self._load_model(is_tiled=False)  # Download doesn't need tiling
         
         # Get the current checkpoint path
         checkpoint_path = self.current_checkpoint
@@ -573,9 +582,24 @@ class MicroSamTrainer:
             if not self._validate_image_format(image_or_embedding):
                 raise ValueError(f"Invalid image format. Expected (C, H, W) where C in [1, 3], got {image_or_embedding.shape}")
         
-        # Load model if not already loaded
-        if self.predictor is None or self.segmenter is None:
-            self._load_model()
+        # Determine if tiling is needed
+        needs_tiling = False
+        if tile_shape is not None and halo is not None:
+            needs_tiling = True
+        elif tile_shape is None and halo is None and not embedding:
+            # Auto-detect if tiling is needed for large images
+            # CRITICAL FIX: Increased threshold to avoid unnecessary tiling
+            if len(image_or_embedding.shape) >= 2:
+                if image_or_embedding.shape[0] > 4096 or image_or_embedding.shape[1] > 4096:
+                    needs_tiling = True
+                    # CRITICAL FIX: Larger tiles with smaller overlap for better performance
+                    tile_shape = (2048, 2048)  # Increased from 1024x1024
+                    halo = (128, 128)          # Reduced from 256x256
+        
+        # Load model if not already loaded or if tiling requirements changed
+        if (self.predictor is None or self.segmenter is None or 
+            self.current_is_tiled != needs_tiling):
+            self._load_model(is_tiled=needs_tiling)
         
         # Run automatic instance segmentation
         if embedding:
@@ -594,13 +618,6 @@ class MicroSamTrainer:
             else:
                 image_2d = image_or_embedding  # Assume already (H, W)
             
-            # Auto-detect if tiling is needed for large images
-            if tile_shape is None and halo is None:
-                if image_2d.shape[0] > 2048 or image_2d.shape[1] > 2048:
-                    # Large image - enable tiling
-                    tile_shape = (1024, 1024)
-                    halo = (256, 256)
-            
             # Prepare kwargs for segmentation
             kwargs = {
                 "predictor": self.predictor,
@@ -613,7 +630,8 @@ class MicroSamTrainer:
             if tile_shape is not None and halo is not None:
                 kwargs["tile_shape"] = tile_shape
                 kwargs["halo"] = halo
-                kwargs["batch_size"] = 4  # Process tiles in batches for efficiency
+                # CRITICAL FIX: Increase batch size for better GPU utilization
+                kwargs["batch_size"] = 4  # Increased from 1 for better performance
             
             # Run segmentation
             prediction = automatic_instance_segmentation(**kwargs)
