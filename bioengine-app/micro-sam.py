@@ -550,16 +550,90 @@ class MicroSamTrainer:
         
         return buffer.getvalue()
 
+    def _decode_jpeg_image(self, jpeg_base64: str) -> np.ndarray:
+        """Decode base64-encoded JPEG image to numpy array."""
+        import base64
+        import io
+        from PIL import Image
+        
+        try:
+            # Decode base64 to get JPEG bytes
+            jpeg_bytes = base64.b64decode(jpeg_base64)
+            
+            # Decode JPEG bytes to PIL Image
+            pil_image = Image.open(io.BytesIO(jpeg_bytes))
+            
+            # Convert PIL Image to numpy array
+            image_array = np.array(pil_image)
+            
+            # Handle different image formats
+            if len(image_array.shape) == 2:
+                # Grayscale: (H, W) -> (1, H, W)
+                image_array = np.expand_dims(image_array, axis=0)
+            elif len(image_array.shape) == 3:
+                # RGB: (H, W, C) -> (C, H, W)
+                image_array = np.transpose(image_array, (2, 0, 1))
+            
+            return image_array
+            
+        except Exception as e:
+            raise ValueError(f"Failed to decode JPEG image: {str(e)}")
+    
+    def _encode_segmentation_to_jpeg(self, segmentation: np.ndarray, quality: int = 95) -> str:
+        """Encode segmentation mask to base64-encoded JPEG string."""
+        import base64
+        import io
+        from PIL import Image
+        
+        try:
+            # Normalize segmentation to 0-255 uint8
+            if segmentation.dtype != np.uint8:
+                # Normalize to 0-255 range
+                if segmentation.max() > segmentation.min():
+                    seg_normalized = ((segmentation - segmentation.min()) / 
+                                    (segmentation.max() - segmentation.min()) * 255).astype(np.uint8)
+                else:
+                    seg_normalized = np.zeros_like(segmentation, dtype=np.uint8)
+            else:
+                seg_normalized = segmentation
+            
+            # Handle different segmentation formats
+            if len(seg_normalized.shape) == 2:
+                # Grayscale mask: (H, W)
+                pil_image = Image.fromarray(seg_normalized, mode='L')
+            elif len(seg_normalized.shape) == 3:
+                # If (C, H, W), convert to (H, W) for grayscale
+                if seg_normalized.shape[0] == 1:
+                    pil_image = Image.fromarray(seg_normalized[0], mode='L')
+                else:
+                    # RGB: (H, W, C)
+                    pil_image = Image.fromarray(seg_normalized, mode='RGB')
+            else:
+                raise ValueError(f"Unsupported segmentation shape: {seg_normalized.shape}")
+            
+            # Encode to JPEG
+            jpeg_buffer = io.BytesIO()
+            pil_image.save(jpeg_buffer, format='JPEG', quality=quality)
+            jpeg_bytes = jpeg_buffer.getvalue()
+            
+            # Encode to base64
+            jpeg_base64 = base64.b64encode(jpeg_bytes).decode('utf-8')
+            
+            return jpeg_base64
+            
+        except Exception as e:
+            raise ValueError(f"Failed to encode segmentation to JPEG: {str(e)}")
+
     @schema_method
     async def segment_all(
         self,
         image_or_embedding: Any = Field(
             ...,
-            description="Input data as numpy array of shape (C, H, W) if image, or (D,) if embedding.",
+            description="Base64-encoded JPEG string (required for images). Numpy arrays are NOT accepted for images.",
         ),
         embedding: bool = Field(
             False,
-            description="If True, the input is treated as an embedding; otherwise, as an image.",
+            description="If True, the input is treated as an embedding; otherwise, as a JPEG image.",
         ),
         tile_shape: Any = Field(
             None,
@@ -572,15 +646,34 @@ class MicroSamTrainer:
     ) -> Any:
         from micro_sam.automatic_segmentation import automatic_instance_segmentation
         
-        # Input validation
+        # Input validation and decoding
         if embedding:
             # For embeddings, expect 1D array
+            if not isinstance(image_or_embedding, np.ndarray):
+                image_or_embedding = np.array(image_or_embedding)
             if len(image_or_embedding.shape) != 1:
                 raise ValueError(f"Expected 1D embedding array, got shape {image_or_embedding.shape}")
         else:
-            # For images, validate format
-            if not self._validate_image_format(image_or_embedding):
-                raise ValueError(f"Invalid image format. Expected (C, H, W) where C in [1, 3], got {image_or_embedding.shape}")
+            # STRICT: For images, ONLY accept base64-encoded JPEG string
+            # NO numpy arrays, NO fallback, NO exceptions
+            if not isinstance(image_or_embedding, str):
+                raise ValueError(
+                    f"ONLY base64-encoded JPEG strings are accepted for images. "
+                    f"Received {type(image_or_embedding).__name__}. "
+                    f"Numpy arrays and other formats are NOT supported. "
+                    f"Please compress your image to JPEG and encode as base64 string."
+                )
+            
+            # Additional check: ensure it's not an empty string
+            if len(image_or_embedding.strip()) == 0:
+                raise ValueError("Empty string provided. Must be a valid base64-encoded JPEG string.")
+            
+            # Decode JPEG image from base64
+            image_array = self._decode_jpeg_image(image_or_embedding)
+            
+            # Validate decoded image format
+            if not self._validate_image_format(image_array):
+                raise ValueError(f"Invalid decoded image format. Expected (C, H, W) where C in [1, 3], got {image_array.shape}")
         
         # Determine if tiling is needed
         needs_tiling = False
@@ -589,12 +682,48 @@ class MicroSamTrainer:
         elif tile_shape is None and halo is None and not embedding:
             # Auto-detect if tiling is needed for large images
             # CRITICAL FIX: Increased threshold to avoid unnecessary tiling
-            if len(image_or_embedding.shape) >= 2:
-                if image_or_embedding.shape[0] > 4096 or image_or_embedding.shape[1] > 4096:
+            if len(image_array.shape) >= 2:
+                # Check image dimensions (H, W from (C, H, W))
+                h, w = image_array.shape[1], image_array.shape[2]
+                if h > 4096 or w > 4096:
                     needs_tiling = True
                     # CRITICAL FIX: Larger tiles with smaller overlap for better performance
                     tile_shape = (2048, 2048)  # Increased from 1024x1024
                     halo = (128, 128)          # Reduced from 256x256
+        
+        # Save image if tiling is needed
+        if needs_tiling:
+            import os
+            import imageio.v3 as imageio
+            from datetime import datetime
+            
+            # Create data directory if it doesn't exist
+            data_dir = "/home/scheng/workspace/ddls2025-microsam-u2os/data"
+            os.makedirs(data_dir, exist_ok=True)
+            
+            # Convert image to saveable format
+            # image_array is (C, H, W), convert to (H, W) or (H, W, C)
+            if len(image_array.shape) == 3 and image_array.shape[0] in [1, 3]:
+                if image_array.shape[0] == 1:
+                    image_to_save = image_array[0]  # (H, W) for grayscale
+                else:
+                    image_to_save = np.transpose(image_array, (1, 2, 0))  # (H, W, C) for RGB
+            else:
+                image_to_save = image_array  # Assume already (H, W)
+            
+            # Normalize to 0-255 if needed
+            if image_to_save.max() <= 1.0:
+                image_to_save = (image_to_save * 255).astype(np.uint8)
+            else:
+                image_to_save = image_to_save.astype(np.uint8)
+            
+            # Generate filename with timestamp
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            image_filename = f"tiled_image_{timestamp}.tif"
+            image_path = os.path.join(data_dir, image_filename)
+            
+            # Save image
+            imageio.imwrite(image_path, image_to_save)
         
         # Load model if not already loaded or if tiling requirements changed
         if (self.predictor is None or self.segmenter is None or 
@@ -609,14 +738,14 @@ class MicroSamTrainer:
             raise NotImplementedError("Embedding-based segmentation not yet implemented")
         else:
             # Convert image to the format expected by microSAM
-            if len(image_or_embedding.shape) == 3 and image_or_embedding.shape[0] in [1, 3]:
+            if len(image_array.shape) == 3 and image_array.shape[0] in [1, 3]:
                 # Convert (C, H, W) to (H, W) for grayscale or (H, W, C) for RGB
-                if image_or_embedding.shape[0] == 1:
-                    image_2d = image_or_embedding[0]  # (H, W)
+                if image_array.shape[0] == 1:
+                    image_2d = image_array[0]  # (H, W)
                 else:
-                    image_2d = np.transpose(image_or_embedding, (1, 2, 0))  # (H, W, C)
+                    image_2d = np.transpose(image_array, (1, 2, 0))  # (H, W, C)
             else:
-                image_2d = image_or_embedding  # Assume already (H, W)
+                image_2d = image_array  # Assume already (H, W)
             
             # Prepare kwargs for segmentation
             kwargs = {
@@ -636,7 +765,25 @@ class MicroSamTrainer:
             # Run segmentation
             prediction = automatic_instance_segmentation(**kwargs)
             
-            return prediction
+            # Convert prediction to numpy array if it's not already
+            if not isinstance(prediction, np.ndarray):
+                # If prediction is a dict or other format, extract the mask
+                if isinstance(prediction, dict):
+                    # Try common keys for segmentation masks
+                    for key in ['segmentation', 'mask', 'masks', 'result']:
+                        if key in prediction:
+                            prediction = prediction[key]
+                            break
+                    else:
+                        raise ValueError(f"Could not find segmentation mask in prediction dict. Keys: {list(prediction.keys())}")
+                else:
+                    prediction = np.array(prediction)
+            
+            # Encode segmentation result to JPEG base64 string
+            # STRICT: Always return JPEG base64, NO numpy arrays
+            jpeg_base64_result = self._encode_segmentation_to_jpeg(prediction, quality=95)
+            
+            return jpeg_base64_result
 
 
 if __name__ == "__main__":

@@ -23,7 +23,7 @@ async def deploy_microsam():
     # Songtao's workspace
     workspace = "agent-lens"
     # Get the worker service
-    worker = await server.get_service(f"{workspace}/bioengine-worker")
+    worker = await server.get_service(f"{workspace}/microsam:bioengine-worker")
     
     print("Loading microSAM service files...")
     
