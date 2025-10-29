@@ -29,7 +29,6 @@ class MicroSamTrainer:
         self.segmenter = None
         self.model_type = "vit_b_lm"
         self.device = "cuda" if self._check_cuda() else "cpu"
-        self.current_is_tiled = None  # Track current tiling mode
         # Initialize checkpoint directory
         import os
         # Use absolute path to project's checkpoint directory
@@ -37,6 +36,10 @@ class MicroSamTrainer:
         self.checkpoint_dir = "/home/scheng/workspace/ddls2025-microsam-u2os/models/checkpoints"
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         self.current_checkpoint = None
+        
+        # Initialize logs directory
+        self.logs_dir = "/home/scheng/workspace/ddls2025-microsam-u2os/logs"
+        os.makedirs(self.logs_dir, exist_ok=True)
     
     def _check_cuda(self):
         """Check CUDA availability without importing torch at module level."""
@@ -164,18 +167,16 @@ class MicroSamTrainer:
                                 mask[seg_mask > 0] = ann_idx + 1
                 
                 # Save label
-                label_filename = f"train_{i:03d}.tif"
                 imageio.imwrite(os.path.join(labels_dir, label_filename), mask)
         
         return temp_dir
     
-    def _load_model(self, checkpoint_path=None, is_tiled=False):
+    def _load_model(self, checkpoint_path=None):
         """Lazy load predictor and segmenter."""
         from micro_sam.automatic_segmentation import get_predictor_and_segmenter
         
-        # PERFORMANCE FIX: Avoid reloading if model is already loaded with same configuration
-        if (self.predictor is not None and self.segmenter is not None and 
-            self.current_is_tiled == is_tiled):
+        # PERFORMANCE FIX: Avoid reloading if model is already loaded
+        if self.predictor is not None and self.segmenter is not None:
             return self.predictor, self.segmenter
         
         # Determine checkpoint to use
@@ -190,16 +191,13 @@ class MicroSamTrainer:
                 checkpoint_path = None  # Use pre-trained
                 self.current_checkpoint = None
         
-        # Load predictor and segmenter
+        # Load predictor and segmenter (without tiling)
         self.predictor, self.segmenter = get_predictor_and_segmenter(
             model_type=self.model_type,
             checkpoint=checkpoint_path,
             device=self.device,
-            is_tiled=is_tiled,
+            is_tiled=False,
         )
-        
-        # Track current tiling mode
-        self.current_is_tiled = is_tiled
         
         return self.predictor, self.segmenter
 
@@ -481,7 +479,10 @@ class MicroSamTrainer:
         
         # Load model if not already loaded
         if self.predictor is None:
-            self._load_model(is_tiled=False)  # Encoding doesn't need tiling
+            self._load_model()
+        
+        # Log input image to logs folder
+        self._save_image_to_logs(image, "input_image", subfolder="encoding")
         
         # Convert image to the format expected by SAM
         if len(image.shape) == 3 and image.shape[0] in [1, 3]:
@@ -520,7 +521,7 @@ class MicroSamTrainer:
         
         # Load model if not already loaded
         if self.predictor is None or self.segmenter is None:
-            self._load_model(is_tiled=False)  # Download doesn't need tiling
+            self._load_model()
         
         # Get the current checkpoint path
         checkpoint_path = self.current_checkpoint
@@ -623,6 +624,208 @@ class MicroSamTrainer:
             
         except Exception as e:
             raise ValueError(f"Failed to encode segmentation to JPEG: {str(e)}")
+    
+    def _save_image_to_logs(self, image: np.ndarray, filename_prefix: str, subfolder: str = "") -> str:
+        """Save image to logs folder with timestamp as JPEG.
+        
+        Args:
+            image: Image array in any format (C, H, W), (H, W), or (H, W, C)
+            filename_prefix: Prefix for the filename (e.g., 'input', 'segmentation', 'encoded')
+            subfolder: Optional subfolder within logs (e.g., 'segmentation', 'encoding')
+        
+        Returns:
+            Path to saved image file
+        """
+        import os
+        from datetime import datetime
+        from PIL import Image
+        
+        # Create subfolder if specified
+        save_dir = os.path.join(self.logs_dir, subfolder) if subfolder else self.logs_dir
+        os.makedirs(save_dir, exist_ok=True)
+        
+        # Generate timestamp for unique filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]  # Include milliseconds
+        filename = f"{filename_prefix}_{timestamp}.jpg"
+        filepath = os.path.join(save_dir, filename)
+        
+        # Convert image to 2D format for saving
+        if len(image.shape) == 3:
+            if image.shape[0] in [1, 3]:
+                # (C, H, W) format
+                if image.shape[0] == 1:
+                    image_2d = image[0]  # (H, W)
+                else:
+                    image_2d = np.transpose(image, (1, 2, 0))  # (H, W, C)
+            else:
+                # Assume (H, W, C) format
+                image_2d = image
+        else:
+            # Already 2D
+            image_2d = image
+        
+        # Normalize to uint8 if needed
+        if image_2d.dtype != np.uint8:
+            if image_2d.max() <= 1.0:
+                image_2d = (image_2d * 255).astype(np.uint8)
+            elif image_2d.max() <= 255:
+                image_2d = image_2d.astype(np.uint8)
+            else:
+                # Normalize to 0-255 range
+                if image_2d.max() > image_2d.min():
+                    image_2d = ((image_2d - image_2d.min()) / 
+                               (image_2d.max() - image_2d.min()) * 255).astype(np.uint8)
+                else:
+                    image_2d = np.zeros_like(image_2d, dtype=np.uint8)
+        
+        # Save image as JPEG
+        try:
+            # Convert to PIL Image
+            if len(image_2d.shape) == 2:
+                # Grayscale: (H, W)
+                pil_image = Image.fromarray(image_2d, mode='L')
+            elif len(image_2d.shape) == 3:
+                # RGB: (H, W, C)
+                if image_2d.shape[2] == 3:
+                    pil_image = Image.fromarray(image_2d, mode='RGB')
+                elif image_2d.shape[2] == 1:
+                    pil_image = Image.fromarray(image_2d[:, :, 0], mode='L')
+                else:
+                    pil_image = Image.fromarray(image_2d[:, :, :3], mode='RGB')
+            else:
+                pil_image = Image.fromarray(image_2d, mode='L')
+            
+            # Save as JPEG with 95% quality
+            pil_image.save(filepath, format='JPEG', quality=95)
+            return filepath
+        except Exception as e:
+            # Log error but don't fail the operation
+            import logging
+            logging.warning(f"Failed to save image to logs: {str(e)}")
+            return ""
+    
+    def _combine_images_side_by_side(self, image1: np.ndarray, image2: np.ndarray, 
+                                     label1: str = "Input", label2: str = "Segmentation") -> np.ndarray:
+        """Combine two images side-by-side with labels for comparison.
+        
+        Args:
+            image1: First image array
+            image2: Second image array
+            label1: Label for first image (default: "Input")
+            label2: Label for second image (default: "Segmentation")
+        
+        Returns:
+            Combined image as numpy array (H, W, C) in RGB format
+        """
+        from PIL import Image, ImageDraw, ImageFont
+        
+        # Normalize both images to (H, W) or (H, W, C) format
+        def normalize_to_2d(img):
+            if len(img.shape) == 3:
+                if img.shape[0] in [1, 3]:
+                    # (C, H, W) format
+                    if img.shape[0] == 1:
+                        return img[0]  # (H, W)
+                    else:
+                        return np.transpose(img, (1, 2, 0))  # (H, W, C)
+            return img  # Already in correct format
+        
+        img1_2d = normalize_to_2d(image1)
+        img2_2d = normalize_to_2d(image2)
+        
+        # Ensure both images have same height (resize if needed)
+        h1, w1 = img1_2d.shape[:2]
+        h2, w2 = img2_2d.shape[:2]
+        
+        # Use the maximum height
+        max_h = max(h1, h2)
+        
+        # Resize images to same height if needed
+        if h1 != max_h or h2 != max_h:
+            from PIL import Image as PILImage
+            if len(img1_2d.shape) == 2:
+                pil1 = PILImage.fromarray(img1_2d, mode='L').resize((w1, max_h), PILImage.Resampling.LANCZOS)
+            else:
+                pil1 = PILImage.fromarray(img1_2d).resize((w1, max_h), PILImage.Resampling.LANCZOS)
+            img1_2d = np.array(pil1)
+            
+            if len(img2_2d.shape) == 2:
+                pil2 = PILImage.fromarray(img2_2d, mode='L').resize((w2, max_h), PILImage.Resampling.LANCZOS)
+            else:
+                pil2 = PILImage.fromarray(img2_2d).resize((w2, max_h), PILImage.Resampling.LANCZOS)
+            img2_2d = np.array(pil2)
+        
+        # Normalize to uint8 for display
+        def normalize_to_uint8(img):
+            if img.dtype != np.uint8:
+                if img.max() <= 1.0:
+                    img = (img * 255).astype(np.uint8)
+                elif img.max() <= 255:
+                    img = img.astype(np.uint8)
+                else:
+                    if img.max() > img.min():
+                        img = ((img - img.min()) / (img.max() - img.min()) * 255).astype(np.uint8)
+                    else:
+                        img = np.zeros_like(img, dtype=np.uint8)
+            return img
+        
+        img1_2d = normalize_to_uint8(img1_2d)
+        img2_2d = normalize_to_uint8(img2_2d)
+        
+        # Convert grayscale to RGB if needed
+        if len(img1_2d.shape) == 2:
+            img1_rgb = np.stack([img1_2d] * 3, axis=-1)
+        elif img1_2d.shape[2] == 1:
+            img1_rgb = np.repeat(img1_2d, 3, axis=2)
+        else:
+            img1_rgb = img1_2d[:, :, :3]  # Take first 3 channels if more
+        
+        if len(img2_2d.shape) == 2:
+            # For segmentation masks, use color mapping for better visibility
+            img2_rgb = np.zeros((img2_2d.shape[0], img2_2d.shape[1], 3), dtype=np.uint8)
+            # Create a colored overlay for the segmentation mask
+            mask_normalized = img2_2d / 255.0 if img2_2d.max() > 0 else img2_2d
+            # Use a color map (green overlay for segmentation)
+            img2_rgb[:, :, 1] = (mask_normalized * 255).astype(np.uint8)  # Green channel
+            # Also show original values in grayscale
+            img2_rgb[:, :, 0] = img2_2d
+            img2_rgb[:, :, 2] = img2_2d
+        elif img2_2d.shape[2] == 1:
+            mask_normalized = img2_2d[:, :, 0] / 255.0 if img2_2d.max() > 0 else img2_2d[:, :, 0]
+            img2_rgb = np.zeros((img2_2d.shape[0], img2_2d.shape[1], 3), dtype=np.uint8)
+            img2_rgb[:, :, 1] = (mask_normalized * 255).astype(np.uint8)
+            img2_rgb[:, :, 0] = img2_2d[:, :, 0]
+            img2_rgb[:, :, 2] = img2_2d[:, :, 0]
+        else:
+            img2_rgb = img2_2d[:, :, :3]
+        
+        # Combine images side-by-side
+        combined_width = img1_rgb.shape[1] + img2_rgb.shape[1]
+        combined_height = img1_rgb.shape[0]
+        combined = np.zeros((combined_height, combined_width, 3), dtype=np.uint8)
+        
+        combined[:, :img1_rgb.shape[1], :] = img1_rgb
+        combined[:, img1_rgb.shape[1]:, :] = img2_rgb
+        
+        # Add labels using PIL
+        pil_combined = Image.fromarray(combined, mode='RGB')
+        draw = ImageDraw.Draw(pil_combined)
+        
+        # Try to use a default font, fallback to basic if not available
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 20)
+        except:
+            try:
+                font = ImageFont.truetype("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf", 20)
+            except:
+                font = ImageFont.load_default()
+        
+        # Add labels at the top of each image
+        text_color = (255, 255, 0)  # Yellow text
+        draw.text((10, 10), label1, fill=text_color, font=font)
+        draw.text((img1_rgb.shape[1] + 10, 10), label2, fill=text_color, font=font)
+        
+        return np.array(pil_combined)
 
     @schema_method
     async def segment_all(
@@ -634,14 +837,6 @@ class MicroSamTrainer:
         embedding: bool = Field(
             False,
             description="If True, the input is treated as an embedding; otherwise, as a JPEG image.",
-        ),
-        tile_shape: Any = Field(
-            None,
-            description="Tile shape for large images (e.g., (1024, 1024)). None for auto-detection.",
-        ),
-        halo: Any = Field(
-            None,
-            description="Tile overlap for large images (e.g., (256, 256)). None for auto-detection.",
         ),
     ) -> Any:
         from micro_sam.automatic_segmentation import automatic_instance_segmentation
@@ -675,60 +870,9 @@ class MicroSamTrainer:
             if not self._validate_image_format(image_array):
                 raise ValueError(f"Invalid decoded image format. Expected (C, H, W) where C in [1, 3], got {image_array.shape}")
         
-        # Determine if tiling is needed
-        needs_tiling = False
-        if tile_shape is not None and halo is not None:
-            needs_tiling = True
-        elif tile_shape is None and halo is None and not embedding:
-            # Auto-detect if tiling is needed for large images
-            # CRITICAL FIX: Increased threshold to avoid unnecessary tiling
-            if len(image_array.shape) >= 2:
-                # Check image dimensions (H, W from (C, H, W))
-                h, w = image_array.shape[1], image_array.shape[2]
-                if h > 4096 or w > 4096:
-                    needs_tiling = True
-                    # CRITICAL FIX: Larger tiles with smaller overlap for better performance
-                    tile_shape = (2048, 2048)  # Increased from 1024x1024
-                    halo = (128, 128)          # Reduced from 256x256
-        
-        # Save image if tiling is needed
-        if needs_tiling:
-            import os
-            import imageio.v3 as imageio
-            from datetime import datetime
-            
-            # Create data directory if it doesn't exist
-            data_dir = "/home/scheng/workspace/ddls2025-microsam-u2os/data"
-            os.makedirs(data_dir, exist_ok=True)
-            
-            # Convert image to saveable format
-            # image_array is (C, H, W), convert to (H, W) or (H, W, C)
-            if len(image_array.shape) == 3 and image_array.shape[0] in [1, 3]:
-                if image_array.shape[0] == 1:
-                    image_to_save = image_array[0]  # (H, W) for grayscale
-                else:
-                    image_to_save = np.transpose(image_array, (1, 2, 0))  # (H, W, C) for RGB
-            else:
-                image_to_save = image_array  # Assume already (H, W)
-            
-            # Normalize to 0-255 if needed
-            if image_to_save.max() <= 1.0:
-                image_to_save = (image_to_save * 255).astype(np.uint8)
-            else:
-                image_to_save = image_to_save.astype(np.uint8)
-            
-            # Generate filename with timestamp
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            image_filename = f"tiled_image_{timestamp}.tif"
-            image_path = os.path.join(data_dir, image_filename)
-            
-            # Save image
-            imageio.imwrite(image_path, image_to_save)
-        
-        # Load model if not already loaded or if tiling requirements changed
-        if (self.predictor is None or self.segmenter is None or 
-            self.current_is_tiled != needs_tiling):
-            self._load_model(is_tiled=needs_tiling)
+        # Load model if not already loaded
+        if self.predictor is None or self.segmenter is None:
+            self._load_model()
         
         # Run automatic instance segmentation
         if embedding:
@@ -755,13 +899,6 @@ class MicroSamTrainer:
                 "ndim": 2,
             }
             
-            # Add tiling parameters if provided
-            if tile_shape is not None and halo is not None:
-                kwargs["tile_shape"] = tile_shape
-                kwargs["halo"] = halo
-                # CRITICAL FIX: Increase batch size for better GPU utilization
-                kwargs["batch_size"] = 4  # Increased from 1 for better performance
-            
             # Run segmentation
             prediction = automatic_instance_segmentation(**kwargs)
             
@@ -778,6 +915,23 @@ class MicroSamTrainer:
                         raise ValueError(f"Could not find segmentation mask in prediction dict. Keys: {list(prediction.keys())}")
                 else:
                     prediction = np.array(prediction)
+            
+            # Convert to binary mask (uint8): 0 = background, 255 = segmented pixels
+            # Convert from instance segmentation (uint32 with unique IDs) to simple binary mask
+            if prediction.dtype != np.uint8 or prediction.max() > 1:
+                # Create binary mask: anything > 0 becomes 255 (segmented), 0 stays as background
+                prediction = (prediction > 0).astype(np.uint8) * 255
+            
+            # Create combined image (input + segmentation) for comparison
+            combined_image = self._combine_images_side_by_side(
+                image_array, 
+                prediction, 
+                label1="Input", 
+                label2="Segmentation"
+            )
+            
+            # Log combined image to logs folder (side-by-side comparison)
+            self._save_image_to_logs(combined_image, "comparison", subfolder="segmentation")
             
             # Encode segmentation result to JPEG base64 string
             # STRICT: Always return JPEG base64, NO numpy arrays
