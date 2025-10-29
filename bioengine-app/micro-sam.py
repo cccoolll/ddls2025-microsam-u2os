@@ -4,13 +4,24 @@ import numpy as np
 from hypha_rpc.utils.schema import schema_method
 from pydantic import Field, BaseModel, ConfigDict
 from ray import serve
+import requests
+from shapely.geometry import Polygon
+from shapely import wkt
+from skimage import measure
+from datetime import datetime
+import json
+import hashlib
+import struct
+import gzip
+import asyncio
+import aiohttp
 
 
 @serve.deployment(
     ray_actor_options={
         "num_cpus": 4,
         "num_gpus": 2,  # Request 2 GPUs for training
-        "memory": 12 * 1024 * 1024 * 1024,
+        "memory": 14 * 1024 * 1024 * 1024,
         # "runtime_env": {"conda": ["microsam"]},  # Already running in the conda environment in terminal
     },
 )
@@ -37,6 +48,10 @@ class MicroSamTrainer:
         self.checkpoint_dir = "/home/scheng/workspace/ddls2025-microsam-u2os/models/checkpoints"
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         self.current_checkpoint = None
+        
+        # Initialize chunk cache directory for disk persistence
+        self.chunk_cache_dir = "/home/scheng/workspace/ddls2025-microsam-u2os/data/chunk_cache"
+        os.makedirs(self.chunk_cache_dir, exist_ok=True)
     
     def _check_cuda(self):
         """Check CUDA availability without importing torch at module level."""
@@ -624,6 +639,547 @@ class MicroSamTrainer:
         except Exception as e:
             raise ValueError(f"Failed to encode segmentation to JPEG: {str(e)}")
 
+    def _fetch_zarr_metadata(self, zarr_url: str) -> dict:
+        """Fetch zarr metadata from .zattrs file."""
+        try:
+            # Ensure URL ends with /
+            if not zarr_url.endswith('/'):
+                zarr_url += '/'
+            
+            # Fetch .zattrs metadata
+            zattrs_url = f"{zarr_url}.zattrs"
+            response = requests.get(zattrs_url, timeout=30)
+            response.raise_for_status()
+            
+            metadata = response.json()
+            return metadata
+            
+        except Exception as e:
+            raise ValueError(f"Failed to fetch zarr metadata from {zattrs_url}: {str(e)}")
+    
+    def _list_available_chunks(self, zarr_url: str, resolution_level: int) -> list:
+        """List available chunks at a given resolution level."""
+        try:
+            # Ensure URL ends with /
+            if not zarr_url.endswith('/'):
+                zarr_url += '/'
+            
+            # List chunks at resolution level
+            chunks_url = f"{zarr_url}{resolution_level}/"
+            response = requests.get(chunks_url, timeout=30)
+            response.raise_for_status()
+            
+            # Parse JSON response
+            files = response.json()
+            
+            # Extract chunk filenames and parse coordinates
+            chunks = []
+            for file_info in files:
+                if file_info['type'] == 'file' and file_info['name'] not in ['.zarray', '.zattrs', '.zgroup']:
+                    # Parse chunk coordinates from filename: t.c.z.y.x
+                    parts = file_info['name'].split('.')
+                    if len(parts) == 5:
+                        t, c, z, y, x = map(int, parts)
+                        chunks.append({
+                            'name': file_info['name'],
+                            't': t,
+                            'c': c,
+                            'z': z,
+                            'y': y,
+                            'x': x
+                        })
+            
+            return chunks
+            
+        except Exception as e:
+            raise ValueError(f"Failed to list chunks from {chunks_url}: {str(e)}")
+    
+    def _fetch_zarr_chunk(self, chunk_url: str, chunk_shape: tuple, dtype: str) -> np.ndarray:
+        """Fetch and decode a single zarr chunk."""
+        try:
+            # Fetch raw chunk data
+            response = requests.get(chunk_url, timeout=30)
+            response.raise_for_status()
+            
+            # Get raw bytes
+            raw_data = response.content
+            
+            # Try to decompress if gzip compressed
+            try:
+                decompressed_data = gzip.decompress(raw_data)
+            except:
+                # If decompression fails, assume it's not compressed
+                decompressed_data = raw_data
+            
+            # Decode binary data to numpy array
+            chunk_array = np.frombuffer(decompressed_data, dtype=dtype)
+            
+            # Reshape to chunk shape
+            chunk_array = chunk_array.reshape(chunk_shape)
+            
+            return chunk_array
+            
+        except Exception as e:
+            raise ValueError(f"Failed to fetch chunk from {chunk_url}: {str(e)}")
+    
+    def _get_chunk_cache_path(self, chunk_url: str) -> str:
+        """Generate cache file path for a chunk URL."""
+        import os
+        # Create hash-based filename from chunk URL for uniqueness
+        cache_key = hashlib.md5(chunk_url.encode('utf-8')).hexdigest()
+        # Use subdirectory structure (first 2 chars) to avoid too many files in one dir
+        subdir = cache_key[:2]
+        subdir_path = os.path.join(self.chunk_cache_dir, subdir)
+        os.makedirs(subdir_path, exist_ok=True)
+        cache_path = os.path.join(subdir_path, f"{cache_key}.npz")
+        return cache_path
+    
+    async def _load_chunk_from_cache(self, chunk_url: str) -> np.ndarray:
+        """Load chunk from disk cache if available."""
+        import os
+        cache_path = self._get_chunk_cache_path(chunk_url)
+        if os.path.exists(cache_path):
+            try:
+                # Load asynchronously in thread pool to avoid blocking
+                loop = asyncio.get_event_loop()
+                chunk_data = await loop.run_in_executor(None, np.load, cache_path)
+                chunk_array = chunk_data['chunk']
+                chunk_data.close()  # Close the npz file
+                return chunk_array
+            except Exception as e:
+                # If cache load fails, remove corrupted cache file
+                print(f"  Warning: Failed to load cache for chunk, removing corrupted file: {str(e)}")
+                try:
+                    os.remove(cache_path)
+                except:
+                    pass
+                return None
+        return None
+    
+    async def _save_chunk_to_cache(self, chunk_url: str, chunk_array: np.ndarray):
+        """Save chunk to disk cache."""
+        import os
+        cache_path = self._get_chunk_cache_path(chunk_url)
+        try:
+            # Save asynchronously in thread pool to avoid blocking
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None,
+                lambda: np.savez_compressed(cache_path, chunk=chunk_array)
+            )
+        except Exception as e:
+            # Cache save failures shouldn't break the workflow
+            print(f"  Warning: Failed to save chunk to cache: {str(e)}")
+    
+    async def _compose_image_from_chunks(
+        self, 
+        zarr_url: str, 
+        resolution_level: int, 
+        channel_idx: int, 
+        z_idx: int, 
+        t_idx: int,
+        chunk_info: dict
+    ) -> np.ndarray:
+        """Compose full 2D image from zarr chunks using parallel fetching."""
+        try:
+            # Ensure URL ends with /
+            if not zarr_url.endswith('/'):
+                zarr_url += '/'
+            
+            # Get chunk metadata
+            zarray_url = f"{zarr_url}{resolution_level}/.zarray"
+            response = requests.get(zarray_url, timeout=30)
+            response.raise_for_status()
+            zarray = response.json()
+            
+            dtype = zarray['dtype']
+            if dtype.startswith('<') or dtype.startswith('>'):
+                dtype = dtype[1:]  # Remove endianness prefix
+            chunk_shape = tuple(zarray['chunks'])
+            
+            # List available chunks
+            all_chunks = self._list_available_chunks(zarr_url, resolution_level)
+            
+            # Filter chunks matching t, c, z
+            matching_chunks = [
+                ch for ch in all_chunks 
+                if ch['t'] == t_idx and ch['c'] == channel_idx and ch['z'] == z_idx
+            ]
+            
+            if not matching_chunks:
+                raise ValueError(f"No chunks found for t={t_idx}, c={channel_idx}, z={z_idx}")
+            
+            # Determine full image dimensions
+            max_y = max(ch['y'] for ch in matching_chunks)
+            max_x = max(ch['x'] for ch in matching_chunks)
+            
+            # Chunk shape is (t, c, z, y, x) - we want the last 2 dimensions
+            chunk_h, chunk_w = chunk_shape[-2], chunk_shape[-1]
+            
+            # Initialize output array
+            full_h = (max_y + 1) * chunk_h
+            full_w = (max_x + 1) * chunk_w
+            output = np.zeros((full_h, full_w), dtype=dtype)
+            
+            # Fetch chunks in parallel using aiohttp with disk caching
+            async def fetch_chunk(session, chunk):
+                chunk_url = f"{zarr_url}{resolution_level}/{chunk['name']}"
+                try:
+                    # Try loading from cache first
+                    cached_chunk_2d = await self._load_chunk_from_cache(chunk_url)
+                    if cached_chunk_2d is not None:
+                        return chunk, cached_chunk_2d
+                    
+                    # Cache miss - fetch from network
+                    async with session.get(chunk_url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                        resp.raise_for_status()
+                        raw_data = await resp.read()
+                        
+                        # Try to decompress if gzip compressed
+                        try:
+                            decompressed_data = gzip.decompress(raw_data)
+                        except:
+                            decompressed_data = raw_data
+                        
+                        # Decode binary data to numpy array
+                        chunk_array = np.frombuffer(decompressed_data, dtype=dtype)
+                        
+                        # Reshape: chunk is (t, c, z, y, x) but we want (y, x)
+                        chunk_array = chunk_array.reshape(chunk_shape)
+                        # Extract the 2D slice (last 2 dimensions)
+                        chunk_2d = chunk_array[0, 0, 0, :, :]
+                        
+                        # Save to cache asynchronously (don't await to avoid blocking)
+                        # Use create_task to run in background
+                        asyncio.create_task(self._save_chunk_to_cache(chunk_url, chunk_2d))
+                        
+                        return chunk, chunk_2d
+                except Exception as e:
+                    error_type = type(e).__name__
+                    error_msg = str(e)
+                    print(f"Warning: Failed to fetch chunk {chunk['name']}: {error_type}: {error_msg}")
+                    return chunk, None
+            
+            # Fetch chunks in batches to avoid overwhelming the server
+            batch_size = 10  # Fetch 10 chunks at a time
+            results = []
+            
+            async with aiohttp.ClientSession() as session:
+                # Process chunks in batches
+                total_batches = (len(matching_chunks) + batch_size - 1) // batch_size
+                for i in range(0, len(matching_chunks), batch_size):
+                    batch = matching_chunks[i:i + batch_size]
+                    batch_num = i // batch_size + 1
+                    print(f"  Processing batch {batch_num}/{total_batches} ({len(batch)} chunks)...")
+                    
+                    # Create tasks for this batch
+                    tasks = [fetch_chunk(session, chunk) for chunk in batch]
+                    
+                    # Process chunks as they complete (allows yielding control for health checks)
+                    # This prevents blocking the event loop and allows health checks to be processed
+                    batch_results_map = {}
+                    for coro in asyncio.as_completed(tasks):
+                        try:
+                            chunk, chunk_data = await coro
+                            batch_results_map[chunk['name']] = (chunk, chunk_data)
+                        except Exception as e:
+                            # Extract chunk from exception if possible, otherwise use placeholder
+                            pass
+                        # Yield control after each chunk to allow health checks
+                        await asyncio.sleep(0)
+                    
+                    # Reconstruct batch results in original order
+                    batch_results = []
+                    for chunk in batch:
+                        if chunk['name'] in batch_results_map:
+                            batch_results.append(batch_results_map[chunk['name']])
+                        else:
+                            # Chunk failed or wasn't processed
+                            batch_results.append((chunk, None))
+                    
+                    results.extend(batch_results)
+                    
+                    # Small delay between batches to avoid overwhelming the server and allow health checks
+                    await asyncio.sleep(0.2)
+            
+            # Place chunks in output array
+            successful = 0
+            failed = 0
+            for chunk, chunk_data in results:
+                if chunk_data is not None:
+                    y_start = chunk['y'] * chunk_h
+                    y_end = y_start + chunk_h
+                    x_start = chunk['x'] * chunk_w
+                    x_end = x_start + chunk_w
+                    
+                    output[y_start:y_end, x_start:x_end] = chunk_data
+                    successful += 1
+                else:
+                    failed += 1
+            
+            print(f"  Chunk loading complete: {successful} succeeded, {failed} failed out of {len(matching_chunks)} total")
+            
+            return output
+            
+        except Exception as e:
+            raise ValueError(f"Failed to compose image from chunks: {str(e)}")
+    
+    async def _apply_contrast_adjustment(
+        self, 
+        image: np.ndarray, 
+        min_percentile: float, 
+        max_percentile: float
+    ) -> np.ndarray:
+        """Apply contrast adjustment using min/max clipping and normalization.
+        
+        For uint8 images (0-255 range): Simple min/max clipping and linear normalization.
+        Memory-efficient: processes in blocks to avoid large float64 allocations.
+        
+        Note: min_percentile and max_percentile parameters are kept for API compatibility but not used.
+        """
+        try:
+            h, w = image.shape[:2]
+            image_dtype = image.dtype
+            
+            # Step 1: Compute min/max on downsampled image for speed (for very large images)
+            max_sample_size = 2048  # Target max dimension for sampling
+            loop = asyncio.get_event_loop()
+            
+            def compute_min_max(img):
+                """Compute min and max values."""
+                return float(img.min()), float(img.max())
+            
+            if h > max_sample_size or w > max_sample_size:
+                # Downsample using decimation (taking every nth pixel) for speed
+                scale_factor = max(h, w) / max_sample_size
+                step = max(1, int(scale_factor))
+                image_sample = image[::step, ::step]
+                print(f"  Computing min/max on downsampled image: {image_sample.shape} (from {image.shape})")
+                vmin, vmax = await loop.run_in_executor(None, compute_min_max, image_sample)
+                
+                # Yield control before computing full image min/max
+                await asyncio.sleep(0)
+                
+                # Use full image min/max to ensure we don't miss actual range
+                # This is still CPU-intensive, so run in executor
+                img_min, img_max = await loop.run_in_executor(
+                    None, 
+                    lambda: (float(image.min()), float(image.max()))
+                )
+                
+                # Use the more conservative range (wider)
+                vmin = min(vmin, img_min)
+                vmax = max(vmax, img_max)
+                
+                print(f"  Min/Max: vmin={vmin:.2f}, vmax={vmax:.2f} (image range: {img_min}-{img_max}, dtype={image_dtype})")
+            else:
+                # Image is small enough, process directly
+                vmin, vmax = await loop.run_in_executor(None, compute_min_max, image)
+                img_min, img_max = vmin, vmax
+                print(f"  Min/Max: vmin={vmin:.2f}, vmax={vmax:.2f} (image range: {img_min}-{img_max}, dtype={image_dtype})")
+            
+            # Check if image is constant
+            if vmin == vmax:
+                print(f"  Image is constant ({vmin}), returning unchanged")
+                return image.astype(np.uint8)
+            
+            # Yield control to allow health checks
+            await asyncio.sleep(0)
+            
+            # Step 2: Apply adjustment in blocks (clip to min/max range, then normalize to 0-255)
+            # Pre-allocate output as uint8 to avoid large float64 arrays
+            image_normalized = np.zeros_like(image, dtype=np.uint8)
+            
+            # Process in blocks to avoid memory issues
+            block_size = 4096  # Process 4K rows at a time
+            total_blocks = (h + block_size - 1) // block_size
+            
+            def process_block(start_row):
+                """Clip block to min/max range and normalize to 0-255."""
+                end_row = min(start_row + block_size, h)
+                block = image[start_row:end_row, :]
+                
+                # Step 1: Clip to min/max range
+                block_clipped = np.clip(block, vmin, vmax)
+                
+                # Step 2: Normalize to 0-255: (value - vmin) / (vmax - vmin) * 255
+                # Use float32 for intermediate calculations to save memory vs float64
+                range_size = vmax - vmin
+                if range_size > 0:
+                    block_normalized = ((block_clipped.astype(np.float32) - vmin) / range_size * 255).astype(np.uint8)
+                else:
+                    block_normalized = block_clipped.astype(np.uint8)
+                
+                return start_row, end_row, block_normalized
+            
+            # Process blocks in parallel batches
+            # Reduce parallel blocks to yield more frequently for health checks
+            parallel_blocks = 2  # Process 2 blocks in parallel (reduced for more frequent yields)
+            
+            print(f"  Processing {total_blocks} blocks ({parallel_blocks} at a time)...")
+            
+            for block_idx in range(0, total_blocks, parallel_blocks):
+                # Get the actual row indices for this batch of blocks
+                block_starts = [min(block_idx + i, total_blocks - 1) * block_size 
+                               for i in range(parallel_blocks) 
+                               if (block_idx + i) < total_blocks]
+                
+                # Process batch in parallel
+                tasks = [loop.run_in_executor(None, process_block, start) 
+                        for start in block_starts]
+                results = await asyncio.gather(*tasks)
+                
+                # Place results in output array
+                for start_row, end_row, block_data in results:
+                    image_normalized[start_row:end_row, :] = block_data
+                
+                # Yield control after every batch to allow health checks
+                await asyncio.sleep(0)
+                
+                # Progress update every few batches
+                if block_idx % (parallel_blocks * 3) == 0 or block_idx == 0:
+                    completed = min(block_idx + parallel_blocks, total_blocks)
+                    progress = completed / total_blocks * 100
+                    print(f"  Contrast adjustment progress: {progress:.1f}% ({completed}/{total_blocks} blocks)")
+            
+            return image_normalized
+            
+        except Exception as e:
+            raise ValueError(f"Failed to apply contrast adjustment: {str(e)}")
+    
+    def _get_pixel_size_um(self, metadata: dict, resolution_level: int) -> float:
+        """Extract pixel size in micrometers from zarr metadata."""
+        try:
+            # Navigate to the correct dataset
+            multiscales = metadata['multiscales'][0]
+            datasets = multiscales['datasets']
+            
+            if resolution_level >= len(datasets):
+                raise ValueError(f"Resolution level {resolution_level} not found in metadata")
+            
+            # Get scale transformation
+            dataset = datasets[resolution_level]
+            transformations = dataset['coordinateTransformations']
+            
+            # Find scale transformation
+            for transform in transformations:
+                if transform['type'] == 'scale':
+                    # Scale is [t, c, z, y, x] - we want y or x (should be same)
+                    scale = transform['scale']
+                    # Return y scale (index -2) or x scale (index -1)
+                    pixel_size_um = scale[-1]  # x scale
+                    return pixel_size_um
+            
+            raise ValueError("Scale transformation not found in metadata")
+            
+        except Exception as e:
+            raise ValueError(f"Failed to extract pixel size from metadata: {str(e)}")
+    
+    def _instance_mask_to_polygons(
+        self, 
+        mask: np.ndarray, 
+        pixel_size_um: float, 
+        image_shape: tuple,
+        metadata: dict,
+        well_id: str,
+        channel_idx: int,
+        resolution_level: int,
+        contrast_percentiles: list
+    ) -> list:
+        """Convert instance segmentation mask to polygon annotations in WKT format."""
+        try:
+            annotations = []
+            
+            # Get unique instance IDs (excluding background 0)
+            instance_ids = np.unique(mask)
+            instance_ids = instance_ids[instance_ids > 0]
+            
+            # Image center (well center)
+            center_y_pixel = image_shape[0] / 2
+            center_x_pixel = image_shape[1] / 2
+            
+            # Get channel label from metadata
+            channel_label = "Unknown"
+            if 'omero' in metadata and 'channels' in metadata['omero']:
+                channels = metadata['omero']['channels']
+                if channel_idx < len(channels):
+                    channel_label = channels[channel_idx].get('label', f"Channel {channel_idx}")
+            
+            # Extract dataset ID and name from metadata or URL
+            dataset_name = metadata.get('squid_canvas', {}).get('fileset_name', 'unknown')
+            dataset_id = "unknown"
+            
+            # Process each instance
+            for inst_id in instance_ids:
+                # Create binary mask for this instance
+                instance_mask = (mask == inst_id).astype(np.uint8)
+                
+                # Find contours
+                contours = measure.find_contours(instance_mask, 0.5)
+                
+                if len(contours) == 0:
+                    continue
+                
+                # Take the longest contour
+                contour = max(contours, key=len)
+                
+                # Convert contour to polygon coordinates
+                # contour is (y, x) in pixel coordinates
+                coords = []
+                for y_pixel, x_pixel in contour:
+                    # Convert to mm relative to well center
+                    x_mm = (x_pixel - center_x_pixel) * pixel_size_um / 1000.0
+                    y_mm = (y_pixel - center_y_pixel) * pixel_size_um / 1000.0
+                    coords.append((x_mm, y_mm))
+                
+                # Create shapely polygon
+                try:
+                    poly = Polygon(coords)
+                    
+                    # Simplify polygon to reduce vertex count
+                    poly_simplified = poly.simplify(tolerance=2.0 * pixel_size_um / 1000.0, preserve_topology=True)
+                    
+                    # Convert to WKT
+                    polygon_wkt = poly_simplified.wkt
+                    
+                    # Generate unique object ID
+                    timestamp = int(datetime.now().timestamp())
+                    hash_str = hashlib.md5(f"{inst_id}_{timestamp}".encode()).hexdigest()[:8]
+                    obj_id = f"obj_{timestamp}_{hash_str}"
+                    
+                    # Create annotation dictionary
+                    annotation = {
+                        "obj_id": obj_id,
+                        "well": well_id,
+                        "type": "polygon",
+                        "description": "Automated cell segmentation",
+                        "timestamp": timestamp,
+                        "created_at": datetime.now().isoformat(),
+                        "bbox": None,
+                        "polygon_wkt": polygon_wkt,
+                        "channels": [{"index": channel_idx, "label": channel_label}],
+                        "process_settings": {
+                            "model": self.model_type,
+                            "resolution_level": resolution_level,
+                            "pixel_size_um": pixel_size_um,
+                            "contrast_percentiles": contrast_percentiles
+                        },
+                        "dataset_id": dataset_id,
+                        "dataset_name": dataset_name,
+                        "embeddings": None
+                    }
+                    
+                    annotations.append(annotation)
+                    
+                except Exception as e:
+                    print(f"Warning: Failed to create polygon for instance {inst_id}: {e}")
+                    continue
+            
+            return annotations
+            
+        except Exception as e:
+            raise ValueError(f"Failed to convert mask to polygons: {str(e)}")
+
     @schema_method
     async def segment_all(
         self,
@@ -784,6 +1340,264 @@ class MicroSamTrainer:
             jpeg_base64_result = self._encode_segmentation_to_jpeg(prediction, quality=95)
             
             return jpeg_base64_result
+
+    @schema_method
+    async def segment_ome_zarr(
+        self,
+        zarr_url: str = Field(
+            ...,
+            description="Base URL to OME-Zarr data (e.g., https://.../data.zarr/)",
+        ),
+        well_id: str = Field(
+            ...,
+            description="Well identifier (e.g., 'C3')",
+        ),
+        channel_idx: int = Field(
+            ...,
+            description="Channel index to segment",
+        ),
+        contrast_min_percentile: float = Field(
+            1.0,
+            description="Minimum contrast percentile for normalization",
+        ),
+        contrast_max_percentile: float = Field(
+            99.0,
+            description="Maximum contrast percentile for normalization",
+        ),
+        resolution_level: int = Field(
+            1,
+            description="Pyramid resolution level (default 1 for ~1.25μm/pixel)",
+        ),
+        z_idx: int = Field(
+            0,
+            description="Z-slice index",
+        ),
+        t_idx: int = Field(
+            0,
+            description="Timepoint index",
+        ),
+        tile_shape: Any = Field(
+            None,
+            description="Tile shape for micro-sam segmentation (e.g., [1024, 1024]). Defaults to [1024, 1024] if None (recommended by micro-sam for large images).",
+        ),
+        halo: Any = Field(
+            None,
+            description="Tile overlap for segmentation (e.g., [256, 256]). Defaults to [256, 256] if None (recommended: larger than half max object radius).",
+        ),
+    ) -> Dict[str, Any]:
+        """Segment OME-Zarr data and return polygon annotations in WKT format with mm coordinates."""
+        
+        try:
+            print(f"🔬 Starting OME-Zarr segmentation for {zarr_url}")
+            
+            # 1. Fetch zarr metadata first (needed for dimensions)
+            print("📊 Fetching zarr metadata...")
+            metadata = self._fetch_zarr_metadata(zarr_url)
+            
+            # Set optimal tile size based on actual image dimensions
+            # List chunks to estimate image size before composition
+            temp_chunks = self._list_available_chunks(zarr_url, resolution_level)
+            if temp_chunks:
+                # Estimate dimensions from chunk coordinates
+                max_y = max(ch['y'] for ch in temp_chunks) + 1
+                max_x = max(ch['x'] for ch in temp_chunks) + 1
+                # Get chunk size from .zarray
+                zarray_url = f"{zarr_url}{resolution_level}/.zarray"
+                zarray_response = requests.get(zarray_url, timeout=30)
+                if zarray_response.ok:
+                    zarray = zarray_response.json()
+                    chunk_shape = tuple(zarray['chunks'])
+                    estimated_h = max_y * chunk_shape[-2]
+                    estimated_w = max_x * chunk_shape[-1]
+                    
+                    # Choose tile size to keep total tiles reasonable (<1000 tiles)
+                    # Formula: target_tiles = (est_h * est_w) / (tile_size^2)
+                    # For <1000 tiles: tile_size = sqrt((est_h * est_w) / 1000)
+                    estimated_pixels = estimated_h * estimated_w
+                    optimal_tile_size = int(np.sqrt(estimated_pixels / 800))  # Target ~800 tiles
+                    # Round to nearest power of 2 for efficiency (2048, 4096, 8192, etc.)
+                    optimal_tile_size = 2 ** int(np.log2(optimal_tile_size))
+                    # Clamp between 2048 and 8192
+                    optimal_tile_size = max(2048, min(8192, optimal_tile_size))
+                else:
+                    optimal_tile_size = 4096  # Default for very large images
+            else:
+                optimal_tile_size = 4096  # Default
+            
+            # Set defaults if None (to avoid JSON serialization issues with tuple/list defaults)
+            if tile_shape is None:
+                tile_shape = [optimal_tile_size, optimal_tile_size]
+                print(f"  Auto-selected tile size: {optimal_tile_size}x{optimal_tile_size} (target: <1000 tiles)")
+            if halo is None:
+                # Halo proportional to tile size: ~12.5% overlap
+                # This balances accuracy vs computation
+                halo_size = max(256, optimal_tile_size // 8)  # At least 256, or 1/8 of tile
+                halo = [halo_size, halo_size]
+                print(f"  Auto-selected halo: {halo_size}x{halo_size} (~{100*halo_size/optimal_tile_size:.1f}% overlap)")
+            
+            # 2. Compose image from chunks
+            print(f"🧩 Composing image from chunks (resolution level {resolution_level}, channel {channel_idx})...")
+            image = await self._compose_image_from_chunks(
+                zarr_url=zarr_url,
+                resolution_level=resolution_level,
+                channel_idx=channel_idx,
+                z_idx=z_idx,
+                t_idx=t_idx,
+                chunk_info={}
+            )
+            
+            print(f"✅ Image composed: shape {image.shape}, dtype {image.dtype}")
+            
+            # # 3. Apply contrast adjustment
+            # print(f"🎨 Applying contrast adjustment ({contrast_min_percentile}%-{contrast_max_percentile}%)...")
+            # image_adjusted = await self._apply_contrast_adjustment(
+            #     image=image,
+            #     min_percentile=contrast_min_percentile,
+            #     max_percentile=contrast_max_percentile
+            # )
+            
+            # 4. Convert to (C, H, W) format for micro-sam
+            # Add channel dimension for grayscale
+            image_chw = np.expand_dims(image, axis=0)  # (1, H, W)
+            
+            print(f"🖼️ Image prepared for segmentation: shape {image_chw.shape}")
+            
+            # 5. Run segmentation directly using automatic_instance_segmentation
+            # micro-sam accepts numpy arrays directly - no file saving needed!
+            # This avoids TIF file size limits and JPEG encoding issues for very large images
+            print("🎯 Running micro-sam segmentation with tiling...")
+            from micro_sam.automatic_segmentation import automatic_instance_segmentation
+            
+            # Convert (1, H, W) to (H, W) - micro-sam expects 2D or 3D (RGB)
+            image_2d = image_chw[0]
+            
+            # Convert lists to tuples if needed
+            tile_shape_tuple = tuple(tile_shape) if isinstance(tile_shape, list) else tile_shape
+            halo_tuple = tuple(halo) if isinstance(halo, list) else halo
+            
+            # Load model with tiling enabled (always use for such large images)
+            # micro-sam FAQ recommends: tile_shape=(1024, 1024), halo=(256, 256)
+            needs_tiling = True  # Always use tiling for images this large
+            if self.predictor is None or self.segmenter is None or not self.current_is_tiled:
+                self._load_model(is_tiled=needs_tiling)
+            
+            # Run segmentation with tiling - pass numpy array directly!
+            kwargs = {
+                "predictor": self.predictor,
+                "segmenter": self.segmenter,
+                "input_path": image_2d,  # Pass numpy array directly, not file path!
+                "ndim": 2,
+            }
+            
+            if tile_shape_tuple is not None and halo_tuple is not None:
+                kwargs["tile_shape"] = tile_shape_tuple
+                kwargs["halo"] = halo_tuple
+                kwargs["batch_size"] = 4  # Process multiple tiles in parallel
+            
+            seg_array = automatic_instance_segmentation(**kwargs)
+            
+            # Ensure seg_array is numpy array
+            if not isinstance(seg_array, np.ndarray):
+                seg_array = np.array(seg_array)
+            
+            print(f"✅ Segmentation completed: shape {seg_array.shape}")
+            
+            # 8. Get pixel size from metadata
+            pixel_size_um = self._get_pixel_size_um(metadata, resolution_level)
+            print(f"📏 Pixel size: {pixel_size_um:.6f} μm/pixel")
+            
+            # 9. Convert instance mask to polygons
+            print("🔺 Converting masks to polygon annotations...")
+            annotations = self._instance_mask_to_polygons(
+                mask=seg_array,
+                pixel_size_um=pixel_size_um,
+                image_shape=image.shape,
+                metadata=metadata,
+                well_id=well_id,
+                channel_idx=channel_idx,
+                resolution_level=resolution_level,
+                contrast_percentiles=[contrast_min_percentile, contrast_max_percentile]
+            )
+            
+            print(f"✅ Generated {len(annotations)} polygon annotations")
+            
+            # 10. Save preview JPEG and JSON files locally
+            import os
+            import imageio.v3 as imageio
+            
+            # Create output directory
+            output_dir = "/home/scheng/workspace/ddls2025-microsam-u2os/data/segmentation_previews"
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # Generate filename with timestamp
+            timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+            preview_filename = f"segmentation_{well_id}_{timestamp_str}.jpg"
+            json_filename = f"annotations_{well_id}_{timestamp_str}.json"
+            
+            preview_path = os.path.join(output_dir, preview_filename)
+            json_path = os.path.join(output_dir, json_filename)
+            
+            # Save preview image
+            print(f"💾 Saving preview to {preview_path}...")
+            imageio.imwrite(preview_path, seg_array)
+            
+            # Save annotations JSON
+            print(f"💾 Saving annotations to {json_path}...")
+            with open(json_path, 'w') as f:
+                json.dump(annotations, f, indent=2)
+            
+            # 11. Return result
+            result = {
+                "annotations": annotations,
+                "preview_path": preview_path,
+                "json_path": json_path,
+                "num_objects": len(annotations),
+                "pixel_size_um": pixel_size_um,
+                "image_shape": image.shape,
+                "resolution_level": resolution_level
+            }
+            
+            print(f"🎉 Segmentation completed successfully!")
+            
+            return result
+            
+        except Exception as e:
+            error_msg = f"OME-Zarr segmentation failed: {str(e)}"
+            print(f"❌ {error_msg}")
+            import traceback
+            traceback.print_exc()
+            raise ValueError(error_msg)
+    
+    def _encode_image_to_jpeg_base64(self, image: np.ndarray, quality: int = 85) -> str:
+        """Encode numpy image to base64-encoded JPEG string."""
+        import base64
+        import io
+        from PIL import Image
+        
+        # Ensure image is uint8
+        if image.dtype != np.uint8:
+            if image.max() <= 1.0:
+                image = (image * 255).astype(np.uint8)
+            else:
+                image = image.astype(np.uint8)
+        
+        # Convert to PIL Image
+        if len(image.shape) == 2:
+            pil_image = Image.fromarray(image, mode='L')
+        elif len(image.shape) == 3:
+            pil_image = Image.fromarray(image, mode='RGB')
+        else:
+            raise ValueError(f"Unsupported image shape: {image.shape}")
+        
+        # Encode to JPEG
+        jpeg_buffer = io.BytesIO()
+        pil_image.save(jpeg_buffer, format='JPEG', quality=quality)
+        jpeg_bytes = jpeg_buffer.getvalue()
+        
+        # Encode to base64
+        jpeg_base64 = base64.b64encode(jpeg_bytes).decode('utf-8')
+        
+        return jpeg_base64
 
 
 if __name__ == "__main__":
