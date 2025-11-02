@@ -551,18 +551,18 @@ class MicroSamTrainer:
         
         return buffer.getvalue()
 
-    def _decode_jpeg_image(self, jpeg_base64: str) -> np.ndarray:
-        """Decode base64-encoded JPEG image to numpy array."""
+    def _decode_image(self, image_base64: str) -> np.ndarray:
+        """Decode base64-encoded PNG image to numpy array."""
         import base64
         import io
         from PIL import Image
         
         try:
-            # Decode base64 to get JPEG bytes
-            jpeg_bytes = base64.b64decode(jpeg_base64)
+            # Decode base64 to get image bytes
+            image_bytes = base64.b64decode(image_base64)
             
-            # Decode JPEG bytes to PIL Image
-            pil_image = Image.open(io.BytesIO(jpeg_bytes))
+            # Decode bytes to PIL Image
+            pil_image = Image.open(io.BytesIO(image_bytes))
             
             # Convert PIL Image to numpy array
             image_array = np.array(pil_image)
@@ -578,10 +578,10 @@ class MicroSamTrainer:
             return image_array
             
         except Exception as e:
-            raise ValueError(f"Failed to decode JPEG image: {str(e)}")
+            raise ValueError(f"Failed to decode PNG image: {str(e)}")
     
-    def _encode_segmentation_to_jpeg(self, segmentation: np.ndarray, quality: int = 95) -> str:
-        """Encode segmentation mask to base64-encoded JPEG string."""
+    def _encode_segmentation_to_png(self, segmentation: np.ndarray) -> str:
+        """Encode segmentation mask to base64-encoded PNG string."""
         import base64
         import io
         from PIL import Image
@@ -612,21 +612,21 @@ class MicroSamTrainer:
             else:
                 raise ValueError(f"Unsupported segmentation shape: {seg_normalized.shape}")
             
-            # Encode to JPEG
-            jpeg_buffer = io.BytesIO()
-            pil_image.save(jpeg_buffer, format='JPEG', quality=quality)
-            jpeg_bytes = jpeg_buffer.getvalue()
+            # Encode to PNG (lossless format)
+            png_buffer = io.BytesIO()
+            pil_image.save(png_buffer, format='PNG')
+            png_bytes = png_buffer.getvalue()
             
             # Encode to base64
-            jpeg_base64 = base64.b64encode(jpeg_bytes).decode('utf-8')
+            png_base64 = base64.b64encode(png_bytes).decode('utf-8')
             
-            return jpeg_base64
+            return png_base64
             
         except Exception as e:
-            raise ValueError(f"Failed to encode segmentation to JPEG: {str(e)}")
+            raise ValueError(f"Failed to encode segmentation to PNG: {str(e)}")
     
     def _save_image_to_logs(self, image: np.ndarray, filename_prefix: str, subfolder: str = "") -> str:
-        """Save image to logs folder with timestamp as JPEG.
+        """Save image to logs folder with timestamp as PNG.
         
         Args:
             image: Image array in any format (C, H, W), (H, W), or (H, W, C)
@@ -646,7 +646,7 @@ class MicroSamTrainer:
         
         # Generate timestamp for unique filename
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]  # Include milliseconds
-        filename = f"{filename_prefix}_{timestamp}.jpg"
+        filename = f"{filename_prefix}_{timestamp}.png"
         filepath = os.path.join(save_dir, filename)
         
         # Convert image to 2D format for saving
@@ -678,7 +678,7 @@ class MicroSamTrainer:
                 else:
                     image_2d = np.zeros_like(image_2d, dtype=np.uint8)
         
-        # Save image as JPEG
+        # Save image as PNG (lossless format)
         try:
             # Convert to PIL Image
             if len(image_2d.shape) == 2:
@@ -695,8 +695,8 @@ class MicroSamTrainer:
             else:
                 pil_image = Image.fromarray(image_2d, mode='L')
             
-            # Save as JPEG with 95% quality
-            pil_image.save(filepath, format='JPEG', quality=95)
+            # Save as PNG (lossless)
+            pil_image.save(filepath, format='PNG')
             return filepath
         except Exception as e:
             # Log error but don't fail the operation
@@ -832,11 +832,11 @@ class MicroSamTrainer:
         self,
         image_or_embedding: Any = Field(
             ...,
-            description="Base64-encoded JPEG string (required for images). Numpy arrays are NOT accepted for images.",
+            description="Base64-encoded PNG string (required for images). Numpy arrays are NOT accepted for images.",
         ),
         embedding: bool = Field(
             False,
-            description="If True, the input is treated as an embedding; otherwise, as a JPEG image.",
+            description="If True, the input is treated as an embedding; otherwise, as a PNG image.",
         ),
     ) -> Any:
         from micro_sam.automatic_segmentation import automatic_instance_segmentation
@@ -849,22 +849,22 @@ class MicroSamTrainer:
             if len(image_or_embedding.shape) != 1:
                 raise ValueError(f"Expected 1D embedding array, got shape {image_or_embedding.shape}")
         else:
-            # STRICT: For images, ONLY accept base64-encoded JPEG string
+            # STRICT: For images, ONLY accept base64-encoded PNG string
             # NO numpy arrays, NO fallback, NO exceptions
             if not isinstance(image_or_embedding, str):
                 raise ValueError(
-                    f"ONLY base64-encoded JPEG strings are accepted for images. "
+                    f"ONLY base64-encoded PNG strings are accepted for images. "
                     f"Received {type(image_or_embedding).__name__}. "
                     f"Numpy arrays and other formats are NOT supported. "
-                    f"Please compress your image to JPEG and encode as base64 string."
+                    f"Please encode your image as PNG and encode as base64 string."
                 )
             
             # Additional check: ensure it's not an empty string
             if len(image_or_embedding.strip()) == 0:
-                raise ValueError("Empty string provided. Must be a valid base64-encoded JPEG string.")
+                raise ValueError("Empty string provided. Must be a valid base64-encoded PNG string.")
             
-            # Decode JPEG image from base64
-            image_array = self._decode_jpeg_image(image_or_embedding)
+            # Decode PNG image from base64
+            image_array = self._decode_image(image_or_embedding)
             
             # Validate decoded image format
             if not self._validate_image_format(image_array):
@@ -933,11 +933,11 @@ class MicroSamTrainer:
             # Log combined image to logs folder (side-by-side comparison)
             self._save_image_to_logs(combined_image, "comparison", subfolder="segmentation")
             
-            # Encode segmentation result to JPEG base64 string
-            # STRICT: Always return JPEG base64, NO numpy arrays
-            jpeg_base64_result = self._encode_segmentation_to_jpeg(prediction, quality=95)
+            # Encode segmentation result to PNG base64 string
+            # STRICT: Always return PNG base64, NO numpy arrays
+            png_base64_result = self._encode_segmentation_to_png(prediction)
             
-            return jpeg_base64_result
+            return png_base64_result
 
 
 if __name__ == "__main__":
