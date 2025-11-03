@@ -40,6 +40,13 @@ class MicroSamTrainer:
         # Initialize logs directory
         self.logs_dir = "/home/scheng/workspace/ddls2025-microsam-u2os/logs"
         os.makedirs(self.logs_dir, exist_ok=True)
+        
+        # PERFORMANCE: Preload model eagerly to avoid first-request delay
+        try:
+            self._load_model()
+        except Exception as e:
+            # If preloading fails, model will load on first use
+            print(f"Warning: Could not preload model: {e}")
     
     def _check_cuda(self):
         """Check CUDA availability without importing torch at module level."""
@@ -564,15 +571,15 @@ class MicroSamTrainer:
             # Decode bytes to PIL Image
             pil_image = Image.open(io.BytesIO(image_bytes))
             
-            # Convert PIL Image to numpy array
-            image_array = np.array(pil_image)
+            # Convert to numpy array in one step with target dtype
+            image_array = np.array(pil_image, dtype=np.uint8)
             
-            # Handle different image formats
+            # Handle format conversion efficiently
             if len(image_array.shape) == 2:
-                # Grayscale: (H, W) -> (1, H, W)
-                image_array = np.expand_dims(image_array, axis=0)
+                # Grayscale: (H, W) -> (1, H, W) - use newaxis (faster than expand_dims)
+                image_array = image_array[np.newaxis, :, :]
             elif len(image_array.shape) == 3:
-                # RGB: (H, W, C) -> (C, H, W)
+                # RGB: (H, W, C) -> (C, H, W) - transpose is already efficient
                 image_array = np.transpose(image_array, (2, 0, 1))
             
             return image_array
@@ -897,6 +904,7 @@ class MicroSamTrainer:
                 "segmenter": self.segmenter,
                 "input_path": image_2d,
                 "ndim": 2,
+                "verbose": False,  # Disable console output for speed
             }
             
             # Run segmentation
@@ -922,16 +930,17 @@ class MicroSamTrainer:
                 # Create binary mask: anything > 0 becomes 255 (segmented), 0 stays as background
                 prediction = (prediction > 0).astype(np.uint8) * 255
             
-            # Create combined image (input + segmentation) for comparison
-            combined_image = self._combine_images_side_by_side(
-                image_array, 
-                prediction, 
-                label1="Input", 
-                label2="Segmentation"
-            )
-            
-            # Log combined image to logs folder (side-by-side comparison)
-            self._save_image_to_logs(combined_image, "comparison", subfolder="segmentation")
+            # PERFORMANCE FIX: Commented out unnecessary image processing and logging
+            # # Create combined image (input + segmentation) for comparison
+            # combined_image = self._combine_images_side_by_side(
+            #     image_array, 
+            #     prediction, 
+            #     label1="Input", 
+            #     label2="Segmentation"
+            # )
+            # 
+            # # Log combined image to logs folder (side-by-side comparison)
+            # self._save_image_to_logs(combined_image, "comparison", subfolder="segmentation")
             
             # Encode segmentation result to PNG base64 string
             # STRICT: Always return PNG base64, NO numpy arrays

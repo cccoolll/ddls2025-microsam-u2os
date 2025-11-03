@@ -57,7 +57,7 @@ async def deploy_microsam():
     
     # Wait for the service to be deployed and started
     print("Waiting for service to start up...")
-    await asyncio.sleep(30)  # Wait longer for Ray Serve to start
+    await asyncio.sleep(50)  # Wait longer for Ray Serve to start
     
     # Get the actual service name from the deployment
     print("Getting deployed service name...")
