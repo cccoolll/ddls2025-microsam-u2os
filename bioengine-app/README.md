@@ -8,11 +8,7 @@
 conda activate microsam
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
-python -m bioengine.worker \
-    --mode single-machine \
-    --head_num_gpus 2 \ #Use
-    --head_num_cpus 4
-    --workspace agent-lens
+python -m bioengine.worker --mode single-machine --head_num_gpus 2 --head_num_cpus 6 --workspace agent-lens --client_id microsam
 ```
 
 This will start a local Ray cluster and register a Hypha service. Note the workspace URL and service ID from the output.
