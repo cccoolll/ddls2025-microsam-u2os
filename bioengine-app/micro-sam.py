@@ -1060,20 +1060,20 @@ class MicroSamTrainer:
             )
             
             # Save visualization as JPEG to logs/segmentation folder
-            import os
-            from datetime import datetime
-            from PIL import Image
+            # import os
+            # from datetime import datetime
+            # from PIL import Image
             
-            segmentation_logs_dir = os.path.join(self.logs_dir, "segmentation")
-            os.makedirs(segmentation_logs_dir, exist_ok=True)
+            # segmentation_logs_dir = os.path.join(self.logs_dir, "segmentation")
+            # os.makedirs(segmentation_logs_dir, exist_ok=True)
             
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-            log_filename = f"segmentation_{timestamp}.jpg"
-            log_filepath = os.path.join(segmentation_logs_dir, log_filename)
+            # timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+            # log_filename = f"segmentation_{timestamp}.jpg"
+            # log_filepath = os.path.join(segmentation_logs_dir, log_filename)
             
-            # Save as JPEG (quality=95 for good balance)
-            pil_combined = Image.fromarray(combined_image, mode='RGB')
-            pil_combined.save(log_filepath, format='JPEG', quality=95)
+            # # Save as JPEG (quality=95 for good balance)
+            # pil_combined = Image.fromarray(combined_image, mode='RGB')
+            # pil_combined.save(log_filepath, format='JPEG', quality=95)
             
             # Return list of polygons for all instances
             return polygons_list
