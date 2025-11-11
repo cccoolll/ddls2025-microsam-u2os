@@ -147,6 +147,7 @@ class MicroSamTrainer:
             
             # Save image
             img_filename = f"train_{i:03d}.tif"
+            label_filename = f"train_{i:03d}.tif"
             imageio.imwrite(os.path.join(images_dir, img_filename), image_2d)
             
             # Create segmentation mask
@@ -833,6 +834,81 @@ class MicroSamTrainer:
         draw.text((img1_rgb.shape[1] + 10, 10), label2, fill=text_color, font=font)
         
         return np.array(pil_combined)
+    
+    def _draw_polygons_on_image(self, image: np.ndarray, polygons_list: List[Dict]) -> np.ndarray:
+        """Draw polygons on an image with different colors for each object.
+        
+        Args:
+            image: Input image array in (H, W) or (H, W, C) format
+            polygons_list: List of polygon dictionaries with 'id' and 'polygons' keys
+            
+        Returns:
+            Image with polygons drawn as RGB array (H, W, 3)
+        """
+        from PIL import Image, ImageDraw
+        import colorsys
+        
+        # Normalize image to (H, W) or (H, W, C) format
+        if len(image.shape) == 3 and image.shape[0] in [1, 3]:
+            if image.shape[0] == 1:
+                image_2d = image[0]  # (H, W)
+            else:
+                image_2d = np.transpose(image, (1, 2, 0))  # (H, W, C)
+        else:
+            image_2d = image
+        
+        # Normalize to uint8
+        if image_2d.dtype != np.uint8:
+            if image_2d.max() <= 1.0:
+                image_2d = (image_2d * 255).astype(np.uint8)
+            elif image_2d.max() <= 255:
+                image_2d = image_2d.astype(np.uint8)
+            else:
+                if image_2d.max() > image_2d.min():
+                    image_2d = ((image_2d - image_2d.min()) / 
+                               (image_2d.max() - image_2d.min()) * 255).astype(np.uint8)
+                else:
+                    image_2d = np.zeros_like(image_2d, dtype=np.uint8)
+        
+        # Convert to RGB
+        if len(image_2d.shape) == 2:
+            image_rgb = np.stack([image_2d] * 3, axis=-1)
+        elif image_2d.shape[2] == 1:
+            image_rgb = np.repeat(image_2d, 3, axis=2)
+        else:
+            image_rgb = image_2d[:, :, :3].copy()
+        
+        # Create PIL image for drawing
+        pil_image = Image.fromarray(image_rgb, mode='RGB')
+        draw = ImageDraw.Draw(pil_image)
+        
+        # Generate distinct colors for each object
+        num_objects = len(polygons_list)
+        colors = []
+        for i in range(num_objects):
+            # Generate colors using HSV color space for better distinction
+            hue = i / max(num_objects, 1)  # Distribute hues evenly
+            saturation = 0.8
+            value = 1.0
+            rgb = colorsys.hsv_to_rgb(hue, saturation, value)
+            colors.append(tuple(int(c * 255) for c in rgb))
+        
+        # Draw polygons for each object
+        for obj_idx, obj_data in enumerate(polygons_list):
+            color = colors[obj_idx % len(colors)]
+            
+            # Draw each polygon for this object
+            for polygon in obj_data['polygons']:
+                if len(polygon) < 3:  # Need at least 3 points for a polygon
+                    continue
+                
+                # Convert polygon points to tuple format for PIL
+                points = [(int(p[0]), int(p[1])) for p in polygon]
+                
+                # Draw polygon outline (thicker line for visibility)
+                draw.polygon(points, outline=color, width=2)
+        
+        return np.array(pil_image)
 
     @schema_method
     async def segment_all(
@@ -847,6 +923,7 @@ class MicroSamTrainer:
         ),
     ) -> Any:
         from micro_sam.automatic_segmentation import automatic_instance_segmentation
+        from skimage.measure import find_contours, regionprops, approximate_polygon
         
         # Input validation and decoding
         if embedding:
@@ -907,46 +984,99 @@ class MicroSamTrainer:
                 "verbose": False,  # Disable console output for speed
             }
             
-            # Run segmentation
-            prediction = automatic_instance_segmentation(**kwargs)
+            # Run segmentation - returns instance segmentation with unique IDs per object
+            instances = automatic_instance_segmentation(**kwargs)
             
             # Convert prediction to numpy array if it's not already
-            if not isinstance(prediction, np.ndarray):
+            if not isinstance(instances, np.ndarray):
                 # If prediction is a dict or other format, extract the mask
-                if isinstance(prediction, dict):
+                if isinstance(instances, dict):
                     # Try common keys for segmentation masks
                     for key in ['segmentation', 'mask', 'masks', 'result']:
-                        if key in prediction:
-                            prediction = prediction[key]
+                        if key in instances:
+                            instances = instances[key]
                             break
                     else:
-                        raise ValueError(f"Could not find segmentation mask in prediction dict. Keys: {list(prediction.keys())}")
+                        raise ValueError(f"Could not find segmentation mask in prediction dict. Keys: {list(instances.keys())}")
                 else:
-                    prediction = np.array(prediction)
+                    instances = np.array(instances)
             
-            # Convert to binary mask (uint8): 0 = background, 255 = segmented pixels
-            # Convert from instance segmentation (uint32 with unique IDs) to simple binary mask
-            if prediction.dtype != np.uint8 or prediction.max() > 1:
-                # Create binary mask: anything > 0 becomes 255 (segmented), 0 stays as background
-                prediction = (prediction > 0).astype(np.uint8) * 255
+            # Extract polygons for each instance object using regionprops
+            # This directly processes the instance mask where each object has a unique ID
+            props = regionprops(instances)
             
-            # PERFORMANCE FIX: Commented out unnecessary image processing and logging
-            # # Create combined image (input + segmentation) for comparison
-            # combined_image = self._combine_images_side_by_side(
-            #     image_array, 
-            #     prediction, 
-            #     label1="Input", 
-            #     label2="Segmentation"
-            # )
-            # 
-            # # Log combined image to logs folder (side-by-side comparison)
-            # self._save_image_to_logs(combined_image, "comparison", subfolder="segmentation")
+            # Create list to store polygons for each object
+            polygons_list = []
             
-            # Encode segmentation result to PNG base64 string
-            # STRICT: Always return PNG base64, NO numpy arrays
-            png_base64_result = self._encode_segmentation_to_png(prediction)
+            # Extract polygon contours for each instance object
+            for prop in props:
+                instance_id = prop.label
+                
+                # Get the mask for this specific instance only
+                instance_mask = (instances == instance_id).astype(np.uint8)
+                
+                # Find contours for this instance with high connectivity for detailed boundaries
+                # fully_connected='high' ensures we capture all boundary pixels
+                contours = find_contours(instance_mask, level=0.5, fully_connected='high')
+                
+                # Convert contours to polygon format with minimal simplification
+                # Each contour is a list of (row, col) coordinates
+                instance_polygons = []
+                for contour in contours:
+                    # Use very low tolerance (0.3 pixels) to preserve fine details
+                    # This removes only truly redundant points while keeping shape accuracy
+                    simplified_contour = approximate_polygon(contour, tolerance=0.3)
+                    
+                    # Ensure we have enough points for a valid polygon
+                    if len(simplified_contour) < 3:
+                        # If simplification removed too many points, use original contour
+                        simplified_contour = contour
+                    
+                    # Convert from (row, col) to (x, y) format
+                    # contour shape: (N, 2) where each row is (row, col)
+                    # Convert to (x, y) by swapping: (col, row) -> (x, y)
+                    polygon = [[float(point[1]), float(point[0])] for point in simplified_contour]
+                    instance_polygons.append(polygon)
+                
+                # Get bounding box from regionprops
+                bbox = prop.bbox  # (min_row, min_col, max_row, max_col)
+                
+                # Store polygon data for this instance
+                polygons_list.append({
+                    "id": int(instance_id),
+                    "polygons": instance_polygons,  # List of polygons (outer contour + holes if any)
+                    "bbox": [int(bbox[1]), int(bbox[0]), int(bbox[3]), int(bbox[2])]  # [x_min, y_min, x_max, y_max]
+                })
             
-            return png_base64_result
+            # Create visualization: draw polygons on image
+            visualization = self._draw_polygons_on_image(image_array, polygons_list)
+            
+            # Combine input image (left) with visualization (right)
+            combined_image = self._combine_images_side_by_side(
+                image_array,
+                visualization,
+                label1="Input",
+                label2="Polygons"
+            )
+            
+            # Save visualization as JPEG to logs/segmentation folder
+            import os
+            from datetime import datetime
+            from PIL import Image
+            
+            segmentation_logs_dir = os.path.join(self.logs_dir, "segmentation")
+            os.makedirs(segmentation_logs_dir, exist_ok=True)
+            
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+            log_filename = f"segmentation_{timestamp}.jpg"
+            log_filepath = os.path.join(segmentation_logs_dir, log_filename)
+            
+            # Save as JPEG (quality=95 for good balance)
+            pil_combined = Image.fromarray(combined_image, mode='RGB')
+            pil_combined.save(log_filepath, format='JPEG', quality=95)
+            
+            # Return list of polygons for all instances
+            return polygons_list
 
 
 if __name__ == "__main__":
