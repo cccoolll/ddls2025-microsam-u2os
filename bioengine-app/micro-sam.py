@@ -1089,21 +1089,38 @@ class MicroSamTrainer:
             10,
             description="Number of pixels to pad around each cell bounding box (default: 10)",
         ),
-    ) -> List[str]:
+    ) -> List[Dict[str, Any]]:
         """
-        Segment cells from an image and return individual cell images as base64-encoded PNG strings.
+        Segment cells from an image and return individual cell images with morphological metadata.
         
         This function:
         1. Runs automatic instance segmentation to detect all cells
         2. Extracts each cell using its bounding box with padding
-        3. Returns a list of cropped cell images as base64-encoded PNG strings
+        3. Computes morphological features for each cell
+        4. Returns a list of dictionaries containing cell images and metadata
         
         Args:
             image: Base64-encoded PNG string of the input image
             padding: Number of pixels to pad around each cell bounding box
             
         Returns:
-            List of base64-encoded PNG strings, one for each detected cell
+            List of dictionaries, one for each detected cell. Each dictionary contains:
+            - "image": Base64-encoded PNG string of the cropped cell
+            - "metadata": Dictionary with morphological features in physical units (px, px²):
+                - area: Cell area in px²
+                - perimeter: Cell perimeter in px
+                - equivalent_diameter: Diameter of circle with same area in px
+                - bbox_width: Bounding box width in px
+                - bbox_height: Bounding box height in px
+                - aspect_ratio: Major axis / minor axis (elongation, unitless)
+                - circularity: 4π×area/perimeter² (roundness, unitless, 1.0 = perfect circle)
+                - eccentricity: 0 = circle, → 1 elongated (unitless)
+                - solidity: Area / convex hull area (unitless)
+                - convexity: Perimeter of convex hull / perimeter (smoothness, unitless)
+                - brightness: Mean pixel intensity of cell region (0-255 for uint8, unitless)
+                - contrast: Standard deviation of pixel intensities (RMS contrast, unitless)
+            
+            Returns None for features that fail to compute.
         """
         from micro_sam.automatic_segmentation import automatic_instance_segmentation
         from skimage.measure import regionprops
@@ -1184,12 +1201,15 @@ class MicroSamTrainer:
         # Get image dimensions for boundary checking
         img_height, img_width = image_2d.shape[:2]
         
-        # List to store individual cell images as base64-encoded PNG strings
-        cell_images = []
+        # List to store results (dictionaries with image and metadata)
+        results = []
         
         # Extract each cell using exact segmentation mask, then add black padding
         for prop in props:
             instance_id = prop.label
+            
+            # Compute morphological metadata BEFORE any image processing
+            metadata = self._compute_cell_metadata(prop)
             
             # Get bounding box: (min_row, min_col, max_row, max_col)
             min_row, min_col, max_row, max_col = prop.bbox
@@ -1210,6 +1230,11 @@ class MicroSamTrainer:
                 # RGB: apply mask to each channel, set background to (0, 0, 0)
                 mask_crop_3d = mask_crop[:, :, np.newaxis]  # (H, W, 1) for broadcasting
                 cell_extracted = image_crop * mask_crop_3d
+            
+            # Compute brightness and contrast from cell region (before padding)
+            brightness_contrast = self._compute_brightness_contrast(image_crop, mask_crop)
+            metadata['brightness'] = brightness_contrast.get('brightness')
+            metadata['contrast'] = brightness_contrast.get('contrast')
             
             # Step 3: Add black padding around the extracted cell
             # Calculate padding dimensions
@@ -1239,7 +1264,13 @@ class MicroSamTrainer:
             
             # Encode cell image to base64 PNG string
             cell_png_base64 = self._encode_cell_to_png(cell_crop_formatted)
-            cell_images.append(cell_png_base64)
+            
+            # Create result dictionary with image and metadata
+            cell_result = {
+                "image": cell_png_base64,
+                "metadata": metadata
+            }
+            results.append(cell_result)
             
             # Save each segmented cell image to logs
             # self._save_image_to_logs(
@@ -1248,8 +1279,8 @@ class MicroSamTrainer:
             #     subfolder="cell_segmentation"
             # )
         
-        # Return list of cell images as base64-encoded PNG strings
-        return cell_images
+        # Return list of dictionaries with cell images and metadata
+        return results
 
     def _encode_cell_to_png(self, cell_image: np.ndarray) -> str:
         """Encode a cell image to base64-encoded PNG string.
@@ -1321,6 +1352,174 @@ class MicroSamTrainer:
             
         except Exception as e:
             raise ValueError(f"Failed to encode cell image to PNG: {str(e)}")
+
+    def _compute_cell_metadata(self, prop) -> Dict[str, Any]:
+        """Compute morphological features from regionprops.
+        
+        Args:
+            prop: A regionprops object from skimage.measure.regionprops
+            
+        Returns:
+            Dictionary with morphological features. Returns None for features
+            that fail to compute (e.g., division by zero, missing attributes).
+            
+        Features (in physical units - pixels):
+            - area: Cell area in px²
+            - perimeter: Cell perimeter in px
+            - equivalent_diameter: Diameter of circle with same area in px
+            - bbox_width: Bounding box width in px
+            - bbox_height: Bounding box height in px
+            - aspect_ratio: Major axis / minor axis (elongation, unitless)
+            - circularity: 4π×area/perimeter² (roundness, unitless, 1.0 = perfect circle)
+            - eccentricity: 0 = circle, → 1 elongated (unitless)
+            - solidity: Area / convex hull area (unitless)
+            - convexity: Perimeter of convex hull / perimeter (smoothness, unitless)
+            - brightness: Mean pixel intensity (computed separately from image, unitless)
+            - contrast: Standard deviation of pixel intensities (computed separately from image, unitless)
+        """
+        import math
+        
+        # Initialize all features to None
+        features = {
+            'area': None,
+            'perimeter': None,
+            'equivalent_diameter': None,
+            'bbox_width': None,
+            'bbox_height': None,
+            'aspect_ratio': None,
+            'circularity': None,
+            'eccentricity': None,
+            'solidity': None,
+            'convexity': None,
+            'brightness': None,
+            'contrast': None
+        }
+        
+        # 1. Area (px²)
+        try:
+            features['area'] = float(prop.area)
+        except Exception:
+            pass
+        
+        # 2. Perimeter (px)
+        try:
+            features['perimeter'] = float(prop.perimeter)
+        except Exception:
+            pass
+        
+        # 3. Equivalent diameter (px)
+        try:
+            features['equivalent_diameter'] = float(prop.equivalent_diameter)
+        except Exception:
+            pass
+        
+        # 4. Bounding box width (px)
+        try:
+            min_row, min_col, max_row, max_col = prop.bbox
+            features['bbox_width'] = float(max_col - min_col)
+        except Exception:
+            pass
+        
+        # 5. Bounding box height (px)
+        try:
+            min_row, min_col, max_row, max_col = prop.bbox
+            features['bbox_height'] = float(max_row - min_row)
+        except Exception:
+            pass
+        
+        # 6. Aspect ratio (unitless) - major axis / minor axis
+        try:
+            if prop.minor_axis_length > 0:
+                features['aspect_ratio'] = float(prop.major_axis_length / prop.minor_axis_length)
+        except Exception:
+            pass
+        
+        # 7. Circularity (unitless) - 4π×area/perimeter²
+        try:
+            if features['perimeter'] is not None and features['perimeter'] > 0 and features['area'] is not None:
+                features['circularity'] = float(4 * math.pi * features['area'] / (features['perimeter'] ** 2))
+        except Exception:
+            pass
+        
+        # 8. Eccentricity (unitless) - 0 = circle, → 1 elongated
+        try:
+            features['eccentricity'] = float(prop.eccentricity)
+        except Exception:
+            pass
+        
+        # 9. Solidity (unitless) - area / convex hull area
+        try:
+            features['solidity'] = float(prop.solidity)
+        except Exception:
+            pass
+        
+        # 10. Convexity (unitless) - perimeter of convex hull / perimeter
+        try:
+            if features['perimeter'] is not None and features['perimeter'] > 0:
+                # Get convex hull perimeter using perimeter_crofton
+                convex_perimeter = float(prop.perimeter_crofton)
+                features['convexity'] = float(convex_perimeter / features['perimeter'])
+        except Exception:
+            pass
+        
+        return features
+
+    def _compute_brightness_contrast(self, cell_image: np.ndarray, cell_mask: np.ndarray) -> Dict[str, float]:
+        """Compute brightness and contrast from cell image region.
+        
+        Args:
+            cell_image: Cropped image region containing the cell (H, W) or (H, W, C)
+            cell_mask: Binary mask indicating cell pixels (H, W), same size as cell_image
+            
+        Returns:
+            Dictionary with 'brightness' and 'contrast' values, or None if computation fails.
+            - brightness: Mean pixel intensity of cell region (0-255 for uint8)
+            - contrast: Standard deviation of pixel intensities (RMS contrast)
+        """
+        try:
+            # Convert to grayscale if RGB
+            if len(cell_image.shape) == 3:
+                # RGB: convert to grayscale using standard weights
+                if cell_image.shape[2] == 3:
+                    # Use luminance formula: 0.299*R + 0.587*G + 0.114*B
+                    gray = (0.299 * cell_image[:, :, 0] + 
+                           0.587 * cell_image[:, :, 1] + 
+                           0.114 * cell_image[:, :, 2])
+                else:
+                    gray = cell_image[:, :, 0]
+            else:
+                gray = cell_image
+            
+            # Normalize to 0-255 range if needed
+            if gray.dtype != np.uint8:
+                if gray.max() <= 1.0:
+                    gray = (gray * 255).astype(np.uint8)
+                elif gray.max() <= 255:
+                    gray = gray.astype(np.uint8)
+                else:
+                    # Normalize to 0-255 range
+                    if gray.max() > gray.min():
+                        gray = ((gray - gray.min()) / 
+                               (gray.max() - gray.min()) * 255).astype(np.uint8)
+                    else:
+                        gray = np.zeros_like(gray, dtype=np.uint8)
+            
+            # Extract only cell pixels (where mask > 0)
+            cell_pixels = gray[cell_mask > 0]
+            
+            if len(cell_pixels) == 0:
+                return {'brightness': None, 'contrast': None}
+            
+            # Compute brightness (mean intensity)
+            brightness = float(np.mean(cell_pixels))
+            
+            # Compute contrast (standard deviation / RMS contrast)
+            contrast = float(np.std(cell_pixels))
+            
+            return {'brightness': brightness, 'contrast': contrast}
+            
+        except Exception:
+            return {'brightness': None, 'contrast': None}
 
 
 if __name__ == "__main__":
