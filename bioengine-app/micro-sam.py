@@ -1078,6 +1078,250 @@ class MicroSamTrainer:
             # Return list of polygons for all instances
             return polygons_list
 
+    @schema_method
+    async def segment_cells_from_image(
+        self,
+        image: Any = Field(
+            ...,
+            description="Base64-encoded PNG string. Numpy arrays are NOT accepted.",
+        ),
+        padding: int = Field(
+            10,
+            description="Number of pixels to pad around each cell bounding box (default: 10)",
+        ),
+    ) -> List[str]:
+        """
+        Segment cells from an image and return individual cell images as base64-encoded PNG strings.
+        
+        This function:
+        1. Runs automatic instance segmentation to detect all cells
+        2. Extracts each cell using its bounding box with padding
+        3. Returns a list of cropped cell images as base64-encoded PNG strings
+        
+        Args:
+            image: Base64-encoded PNG string of the input image
+            padding: Number of pixels to pad around each cell bounding box
+            
+        Returns:
+            List of base64-encoded PNG strings, one for each detected cell
+        """
+        from micro_sam.automatic_segmentation import automatic_instance_segmentation
+        from skimage.measure import regionprops
+        
+        # Input validation and decoding
+        # STRICT: For images, ONLY accept base64-encoded PNG string
+        if not isinstance(image, str):
+            raise ValueError(
+                f"ONLY base64-encoded PNG strings are accepted for images. "
+                f"Received {type(image).__name__}. "
+                f"Numpy arrays and other formats are NOT supported. "
+                f"Please encode your image as PNG and encode as base64 string."
+            )
+        
+        # Additional check: ensure it's not an empty string
+        if len(image.strip()) == 0:
+            raise ValueError("Empty string provided. Must be a valid base64-encoded PNG string.")
+        
+        # Decode PNG image from base64
+        image_array = self._decode_image(image)
+        
+        # Validate decoded image format
+        if not self._validate_image_format(image_array):
+            raise ValueError(f"Invalid decoded image format. Expected (C, H, W) where C in [1, 3], got {image_array.shape}")
+        
+        # Save input image to logs
+        #self._save_image_to_logs(image_array, "input_image", subfolder="cell_segmentation")
+        
+        # Load model if not already loaded
+        if self.predictor is None or self.segmenter is None:
+            self._load_model()
+        
+        # Convert image to the format expected by microSAM
+        if len(image_array.shape) == 3 and image_array.shape[0] in [1, 3]:
+            # Convert (C, H, W) to (H, W) for grayscale or (H, W, C) for RGB
+            if image_array.shape[0] == 1:
+                image_2d = image_array[0]  # (H, W)
+            else:
+                image_2d = np.transpose(image_array, (1, 2, 0))  # (H, W, C)
+        else:
+            image_2d = image_array  # Assume already (H, W)
+        
+        # Prepare kwargs for segmentation
+        kwargs = {
+            "predictor": self.predictor,
+            "segmenter": self.segmenter,
+            "input_path": image_2d,
+            "ndim": 2,
+            "verbose": False,  # Disable console output for speed
+        }
+        
+        # Run segmentation - returns instance segmentation with unique IDs per object
+        instances = automatic_instance_segmentation(**kwargs)
+        
+        # Convert prediction to numpy array if it's not already
+        if not isinstance(instances, np.ndarray):
+            if isinstance(instances, dict):
+                for key in ['segmentation', 'mask', 'masks', 'result']:
+                    if key in instances:
+                        instances = instances[key]
+                        break
+                else:
+                    raise ValueError(f"Could not find segmentation mask in prediction dict. Keys: {list(instances.keys())}")
+            else:
+                instances = np.array(instances)
+        
+        # Extract individual cell images using regionprops
+        props = regionprops(instances)
+        
+        # Save segmentation mask (instance image) to logs
+        # Convert instances to (1, H, W) format for saving
+        # if len(instances.shape) == 2:
+        #     instances_formatted = instances[np.newaxis, :, :]  # (1, H, W)
+        # else:
+        #     instances_formatted = instances
+        # self._save_image_to_logs(instances_formatted, "segmentation_mask", subfolder="cell_segmentation")
+        
+        # Get image dimensions for boundary checking
+        img_height, img_width = image_2d.shape[:2]
+        
+        # List to store individual cell images as base64-encoded PNG strings
+        cell_images = []
+        
+        # Extract each cell using exact segmentation mask, then add black padding
+        for prop in props:
+            instance_id = prop.label
+            
+            # Get bounding box: (min_row, min_col, max_row, max_col)
+            min_row, min_col, max_row, max_col = prop.bbox
+            
+            # Get the exact cell mask for this instance
+            # Create mask where this specific instance exists
+            cell_mask = (instances == instance_id).astype(np.uint8)
+            
+            # Step 1: Crop the exact bounding box region (without padding) from both image and mask
+            image_crop = image_2d[min_row:max_row, min_col:max_col]
+            mask_crop = cell_mask[min_row:max_row, min_col:max_col]
+            
+            # Step 2: Apply mask to extract only cell pixels (set background to black)
+            if len(image_crop.shape) == 2:
+                # Grayscale: apply mask, set background to 0 (black)
+                cell_extracted = image_crop * mask_crop
+            else:
+                # RGB: apply mask to each channel, set background to (0, 0, 0)
+                mask_crop_3d = mask_crop[:, :, np.newaxis]  # (H, W, 1) for broadcasting
+                cell_extracted = image_crop * mask_crop_3d
+            
+            # Step 3: Add black padding around the extracted cell
+            # Calculate padding dimensions
+            crop_height, crop_width = cell_extracted.shape[:2]
+            padded_height = crop_height + 2 * padding
+            padded_width = crop_width + 2 * padding
+            
+            # Create padded image filled with black (0)
+            if len(cell_extracted.shape) == 2:
+                # Grayscale: create black image and place cell in center
+                cell_padded = np.zeros((padded_height, padded_width), dtype=cell_extracted.dtype)
+                cell_padded[padding:padding + crop_height, padding:padding + crop_width] = cell_extracted
+            else:
+                # RGB: create black image and place cell in center
+                cell_padded = np.zeros((padded_height, padded_width, cell_extracted.shape[2]), dtype=cell_extracted.dtype)
+                cell_padded[padding:padding + crop_height, padding:padding + crop_width, :] = cell_extracted
+            
+            # Convert padded cell to (C, H, W) format for consistency
+            if len(cell_padded.shape) == 2:
+                # Grayscale: (H, W) -> (1, H, W)
+                cell_crop_formatted = cell_padded[np.newaxis, :, :]
+            elif len(cell_padded.shape) == 3:
+                # RGB: (H, W, C) -> (C, H, W)
+                cell_crop_formatted = np.transpose(cell_padded, (2, 0, 1))
+            else:
+                cell_crop_formatted = cell_padded
+            
+            # Encode cell image to base64 PNG string
+            cell_png_base64 = self._encode_cell_to_png(cell_crop_formatted)
+            cell_images.append(cell_png_base64)
+            
+            # Save each segmented cell image to logs
+            # self._save_image_to_logs(
+            #     cell_crop_formatted, 
+            #     f"cell_{prop.label:03d}", 
+            #     subfolder="cell_segmentation"
+            # )
+        
+        # Return list of cell images as base64-encoded PNG strings
+        return cell_images
+
+    def _encode_cell_to_png(self, cell_image: np.ndarray) -> str:
+        """Encode a cell image to base64-encoded PNG string.
+        
+        Args:
+            cell_image: Cell image array in (C, H, W) format
+            
+        Returns:
+            Base64-encoded PNG string
+        """
+        import base64
+        import io
+        from PIL import Image
+        
+        try:
+            # Convert (C, H, W) to (H, W) or (H, W, C) for PIL
+            if len(cell_image.shape) == 3:
+                if cell_image.shape[0] == 1:
+                    # Grayscale: (1, H, W) -> (H, W)
+                    image_2d = cell_image[0]
+                elif cell_image.shape[0] == 3:
+                    # RGB: (C, H, W) -> (H, W, C)
+                    image_2d = np.transpose(cell_image, (1, 2, 0))
+                else:
+                    # Unexpected format, use first channel
+                    image_2d = cell_image[0]
+            else:
+                # Already 2D
+                image_2d = cell_image
+            
+            # Normalize to uint8 if needed
+            if image_2d.dtype != np.uint8:
+                if image_2d.max() <= 1.0:
+                    image_2d = (image_2d * 255).astype(np.uint8)
+                elif image_2d.max() <= 255:
+                    image_2d = image_2d.astype(np.uint8)
+                else:
+                    # Normalize to 0-255 range
+                    if image_2d.max() > image_2d.min():
+                        image_2d = ((image_2d - image_2d.min()) / 
+                                   (image_2d.max() - image_2d.min()) * 255).astype(np.uint8)
+                    else:
+                        image_2d = np.zeros_like(image_2d, dtype=np.uint8)
+            
+            # Convert to PIL Image
+            if len(image_2d.shape) == 2:
+                # Grayscale
+                pil_image = Image.fromarray(image_2d, mode='L')
+            elif len(image_2d.shape) == 3:
+                # RGB
+                if image_2d.shape[2] == 3:
+                    pil_image = Image.fromarray(image_2d, mode='RGB')
+                elif image_2d.shape[2] == 1:
+                    pil_image = Image.fromarray(image_2d[:, :, 0], mode='L')
+                else:
+                    pil_image = Image.fromarray(image_2d[:, :, :3], mode='RGB')
+            else:
+                pil_image = Image.fromarray(image_2d, mode='L')
+            
+            # Encode to PNG
+            png_buffer = io.BytesIO()
+            pil_image.save(png_buffer, format='PNG')
+            png_bytes = png_buffer.getvalue()
+            
+            # Encode to base64
+            png_base64 = base64.b64encode(png_bytes).decode('utf-8')
+            
+            return png_base64
+            
+        except Exception as e:
+            raise ValueError(f"Failed to encode cell image to PNG: {str(e)}")
+
 
 if __name__ == "__main__":
     import asyncio
