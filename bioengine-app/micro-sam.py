@@ -1117,8 +1117,11 @@ class MicroSamTrainer:
                 - eccentricity: 0 = circle, → 1 elongated (unitless)
                 - solidity: Area / convex hull area (unitless)
                 - convexity: Perimeter of convex hull / perimeter (smoothness, unitless)
-                - brightness: Mean pixel intensity of cell region (0-255 for uint8, unitless)
-                - contrast: Standard deviation of pixel intensities (RMS contrast, unitless)
+                - brightness: Mean pixel intensity (0-255)
+                - contrast: GLCM contrast (texture variation, unitless)
+                - homogeneity: GLCM homogeneity (texture smoothness, 0-1)
+                - energy: GLCM energy/uniformity (0-1)
+                - correlation: GLCM correlation (texture linearity, -1 to 1)
             
             Returns None for features that fail to compute.
         """
@@ -1231,10 +1234,13 @@ class MicroSamTrainer:
                 mask_crop_3d = mask_crop[:, :, np.newaxis]  # (H, W, 1) for broadcasting
                 cell_extracted = image_crop * mask_crop_3d
             
-            # Compute brightness and contrast from cell region (before padding)
-            brightness_contrast = self._compute_brightness_contrast(image_crop, mask_crop)
-            metadata['brightness'] = brightness_contrast.get('brightness')
-            metadata['contrast'] = brightness_contrast.get('contrast')
+            # Compute brightness and GLCM texture features from cell region (before padding)
+            texture_features = self._compute_brightness_texture(image_crop, mask_crop)
+            metadata['brightness'] = texture_features.get('brightness')
+            metadata['contrast'] = texture_features.get('contrast')
+            metadata['homogeneity'] = texture_features.get('homogeneity')
+            metadata['energy'] = texture_features.get('energy')
+            metadata['correlation'] = texture_features.get('correlation')
             
             # Step 3: Add black padding around the extracted cell
             # Calculate padding dimensions
@@ -1374,8 +1380,11 @@ class MicroSamTrainer:
             - eccentricity: 0 = circle, → 1 elongated (unitless)
             - solidity: Area / convex hull area (unitless)
             - convexity: Perimeter of convex hull / perimeter (smoothness, unitless)
-            - brightness: Mean pixel intensity (computed separately from image, unitless)
-            - contrast: Standard deviation of pixel intensities (computed separately from image, unitless)
+            - brightness: Mean pixel intensity (0-255)
+            - contrast: GLCM contrast (texture variation, unitless)
+            - homogeneity: GLCM homogeneity (texture smoothness, 0-1)
+            - energy: GLCM energy/uniformity (0-1)
+            - correlation: GLCM correlation (texture linearity, -1 to 1)
         """
         import math
         
@@ -1392,7 +1401,10 @@ class MicroSamTrainer:
             'solidity': None,
             'convexity': None,
             'brightness': None,
-            'contrast': None
+            'contrast': None,
+            'homogeneity': None,
+            'energy': None,
+            'correlation': None
         }
         
         # 1. Area (px²)
@@ -1464,18 +1476,23 @@ class MicroSamTrainer:
         
         return features
 
-    def _compute_brightness_contrast(self, cell_image: np.ndarray, cell_mask: np.ndarray) -> Dict[str, float]:
-        """Compute brightness and contrast from cell image region.
+    def _compute_brightness_texture(self, cell_image: np.ndarray, cell_mask: np.ndarray) -> Dict[str, float]:
+        """Compute brightness and GLCM texture features from cell image region.
         
         Args:
             cell_image: Cropped image region containing the cell (H, W) or (H, W, C)
             cell_mask: Binary mask indicating cell pixels (H, W), same size as cell_image
             
         Returns:
-            Dictionary with 'brightness' and 'contrast' values, or None if computation fails.
-            - brightness: Mean pixel intensity of cell region (0-255 for uint8)
-            - contrast: Standard deviation of pixel intensities (RMS contrast)
+            Dictionary with brightness and GLCM texture features, or None if computation fails.
+            - brightness: Mean pixel intensity (0-255)
+            - contrast: GLCM contrast (texture variation, unitless)
+            - homogeneity: GLCM homogeneity (texture smoothness, 0-1)
+            - energy: GLCM energy/uniformity (0-1)
+            - correlation: GLCM correlation (texture linearity, -1 to 1)
         """
+        from skimage.feature import graycomatrix, graycoprops
+        
         try:
             # Convert to grayscale if RGB
             if len(cell_image.shape) == 3:
@@ -1488,38 +1505,88 @@ class MicroSamTrainer:
                 else:
                     gray = cell_image[:, :, 0]
             else:
-                gray = cell_image
+                gray = cell_image.copy()
             
-            # Normalize to 0-255 range if needed
-            if gray.dtype != np.uint8:
-                if gray.max() <= 1.0:
-                    gray = (gray * 255).astype(np.uint8)
-                elif gray.max() <= 255:
-                    gray = gray.astype(np.uint8)
-                else:
-                    # Normalize to 0-255 range
-                    if gray.max() > gray.min():
-                        gray = ((gray - gray.min()) / 
-                               (gray.max() - gray.min()) * 255).astype(np.uint8)
-                    else:
-                        gray = np.zeros_like(gray, dtype=np.uint8)
-            
-            # Extract only cell pixels (where mask > 0)
+            # Extract only cell pixels (where mask > 0) for brightness calculation
             cell_pixels = gray[cell_mask > 0]
             
             if len(cell_pixels) == 0:
-                return {'brightness': None, 'contrast': None}
+                return {
+                    'brightness': None,
+                    'contrast': None,
+                    'homogeneity': None,
+                    'energy': None,
+                    'correlation': None
+                }
             
             # Compute brightness (mean intensity)
             brightness = float(np.mean(cell_pixels))
             
-            # Compute contrast (standard deviation / RMS contrast)
-            contrast = float(np.std(cell_pixels))
+            # Initialize GLCM features to None
+            contrast = None
+            homogeneity = None
+            energy = None
+            correlation = None
             
-            return {'brightness': brightness, 'contrast': contrast}
+            # Only compute GLCM if we have enough pixels (need at least 4 pixels for GLCM)
+            if len(cell_pixels) >= 4:
+                # Ensure uint8 format for GLCM
+                if gray.dtype != np.uint8:
+                    # Normalize to 0-255 range if needed
+                    if gray.max() > 0:
+                        gray = ((gray - gray.min()) / 
+                               (gray.max() - gray.min()) * 255).astype(np.uint8)
+                    else:
+                        gray = gray.astype(np.uint8)
+                
+                # Set non-cell pixels to 0 (background)
+                cell_region = gray.copy()
+                cell_region[cell_mask == 0] = 0
+                
+                # Compute GLCM matrix
+                # distances=[1]: compare adjacent pixels
+                # angles: 0, 45, 90, 135 degrees for rotation invariance
+                # levels: 256 for full uint8 range
+                # symmetric: True, normed: True for standard computation
+                angles = [0, np.pi/4, np.pi/2, 3*np.pi/4]
+                glcm = graycomatrix(
+                    cell_region, 
+                    distances=[1], 
+                    angles=angles,
+                    levels=256,
+                    symmetric=True,
+                    normed=True
+                )
+                
+                # Extract texture properties and average across all angles
+                # This provides rotation-invariant texture features
+                contrast_vals = graycoprops(glcm, 'contrast')[0]
+                homogeneity_vals = graycoprops(glcm, 'homogeneity')[0]
+                energy_vals = graycoprops(glcm, 'energy')[0]
+                correlation_vals = graycoprops(glcm, 'correlation')[0]
+                
+                # Average across all angles for rotation invariance
+                contrast = float(np.mean(contrast_vals))
+                homogeneity = float(np.mean(homogeneity_vals))
+                energy = float(np.mean(energy_vals))
+                correlation = float(np.mean(correlation_vals))
+            
+            return {
+                'brightness': brightness,
+                'contrast': contrast,
+                'homogeneity': homogeneity,
+                'energy': energy,
+                'correlation': correlation
+            }
             
         except Exception:
-            return {'brightness': None, 'contrast': None}
+            return {
+                'brightness': None,
+                'contrast': None,
+                'homogeneity': None,
+                'energy': None,
+                'correlation': None
+            }
 
 
 if __name__ == "__main__":
