@@ -29,6 +29,7 @@ class MicroSamTrainer:
         self.segmenter = None
         self.model_type = "vit_b_lm"
         self.device = "cuda" if self._check_cuda() else "cpu"
+        self.is_tiled = False  # Track current tiling state
         # Initialize checkpoint directory
         import os
         # Use absolute path to project's checkpoint directory
@@ -179,12 +180,13 @@ class MicroSamTrainer:
         
         return temp_dir
     
-    def _load_model(self, checkpoint_path=None):
+    def _load_model(self, checkpoint_path=None, is_tiled=False):
         """Lazy load predictor and segmenter."""
         from micro_sam.automatic_segmentation import get_predictor_and_segmenter
         
-        # PERFORMANCE FIX: Avoid reloading if model is already loaded
-        if self.predictor is not None and self.segmenter is not None:
+        # Reload if tiling state changed or model not loaded
+        if (self.predictor is not None and self.segmenter is not None and 
+            self.is_tiled == is_tiled):
             return self.predictor, self.segmenter
         
         # Determine checkpoint to use
@@ -199,13 +201,14 @@ class MicroSamTrainer:
                 checkpoint_path = None  # Use pre-trained
                 self.current_checkpoint = None
         
-        # Load predictor and segmenter (without tiling)
+        # Load predictor and segmenter with specified tiling state
         self.predictor, self.segmenter = get_predictor_and_segmenter(
             model_type=self.model_type,
             checkpoint=checkpoint_path,
             device=self.device,
-            is_tiled=False,
+            is_tiled=is_tiled,
         )
+        self.is_tiled = is_tiled
         
         return self.predictor, self.segmenter
 
@@ -485,9 +488,9 @@ class MicroSamTrainer:
         if not self._validate_image_format(image):
             raise ValueError(f"Invalid image format. Expected (C, H, W) where C in [1, 3], got {image.shape}")
         
-        # Load model if not already loaded
+        # Load model if not already loaded (use non-tiled for encoding)
         if self.predictor is None:
-            self._load_model()
+            self._load_model(is_tiled=False)
         
         # Log input image to logs folder
         self._save_image_to_logs(image, "input_image", subfolder="encoding")
@@ -921,6 +924,22 @@ class MicroSamTrainer:
             False,
             description="If True, the input is treated as an embedding; otherwise, as a PNG image.",
         ),
+        tiling: bool = Field(
+            False,
+            description="Whether to use tiling for large images. Default is False.",
+        ),
+        tile_shape: Any = Field(
+            None,
+            description="Shape of tiles for tiled prediction (tuple of (height, width)). Default is (512, 512) when tiling is enabled.",
+        ),
+        halo: Any = Field(
+            None,
+            description="Overlap of tiles for tiled prediction (tuple of (height, width)). Default is (128, 128) when tiling is enabled.",
+        ),
+        min_cell_size: int = Field(
+            100,
+            description="Minimum cell size in pixels (area) to filter out small objects. Passed as 'min_size' to the segmenter's generate method. Default is 100.",
+        ),
     ) -> Any:
         from micro_sam.automatic_segmentation import automatic_instance_segmentation
         from skimage.measure import find_contours, regionprops, approximate_polygon
@@ -954,9 +973,31 @@ class MicroSamTrainer:
             if not self._validate_image_format(image_array):
                 raise ValueError(f"Invalid decoded image format. Expected (C, H, W) where C in [1, 3], got {image_array.shape}")
         
-        # Load model if not already loaded
-        if self.predictor is None or self.segmenter is None:
-            self._load_model()
+        # Set default tile_shape and halo if tiling is enabled
+        if tiling:
+            if tile_shape is None:
+                tile_shape = (512, 512)
+            else:
+                # Convert to tuple if it's a list
+                if isinstance(tile_shape, list):
+                    tile_shape = tuple(tile_shape)
+                if not isinstance(tile_shape, tuple) or len(tile_shape) != 2:
+                    raise ValueError(f"tile_shape must be a tuple of (height, width), got {tile_shape}")
+            
+            if halo is None:
+                halo = (128, 128)
+            else:
+                # Convert to tuple if it's a list
+                if isinstance(halo, list):
+                    halo = tuple(halo)
+                if not isinstance(halo, tuple) or len(halo) != 2:
+                    raise ValueError(f"halo must be a tuple of (height, width), got {halo}")
+        else:
+            tile_shape = None
+            halo = None
+        
+        # Load model with appropriate tiling state
+        self._load_model(is_tiled=tiling)
         
         # Run automatic instance segmentation
         if embedding:
@@ -982,7 +1023,13 @@ class MicroSamTrainer:
                 "input_path": image_2d,
                 "ndim": 2,
                 "verbose": False,  # Disable console output for speed
+                "min_size": min_cell_size,  # Pass min_size to segmenter.generate() via generate_kwargs
             }
+            
+            # Add tiling parameters if tiling is enabled
+            if tiling:
+                kwargs["tile_shape"] = tile_shape
+                kwargs["halo"] = halo
             
             # Run segmentation - returns instance segmentation with unique IDs per object
             instances = automatic_instance_segmentation(**kwargs)
