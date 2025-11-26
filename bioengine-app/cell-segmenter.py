@@ -10,11 +10,10 @@ from ray import serve
     ray_actor_options={
         "num_cpus": 4,
         "num_gpus": 2,  # Request 2 GPUs for training
-        "memory": 12 * 1024 * 1024 * 1024,
-        # "runtime_env": {"conda": ["microsam"]},  # Already running in the conda environment in terminal
+        "memory": 16 * 1024 * 1024 * 1024,
     },
 )
-class MicroSamTrainer:
+class CellSegmenter:
     model_config = ConfigDict(arbitrary_types_allowed=True)
     
     def __init__(self):
@@ -24,12 +23,16 @@ class MicroSamTrainer:
         self.fit_error = None
         self.fit_cancelled = False
         
-        # Model state
+        # Model state - microSAM
         self.predictor = None
         self.segmenter = None
         self.model_type = "vit_b_lm"
         self.device = "cuda" if self._check_cuda() else "cpu"
         self.is_tiled = False  # Track current tiling state
+        
+        # Model state - Cellpose
+        self.cellpose_model = None
+        
         # Initialize checkpoint directory
         import os
         # Use absolute path to project's checkpoint directory
@@ -42,12 +45,9 @@ class MicroSamTrainer:
         self.logs_dir = "/home/scheng/workspace/ddls2025-microsam-u2os/logs"
         os.makedirs(self.logs_dir, exist_ok=True)
         
-        # PERFORMANCE: Preload model eagerly to avoid first-request delay
-        try:
-            self._load_model()
-        except Exception as e:
-            # If preloading fails, model will load on first use
-            print(f"Warning: Could not preload model: {e}")
+        # NOTE: Models are loaded lazily on first use to avoid unnecessary imports
+        # - microSAM: loaded when method="microsam" is used
+        # - Cellpose: loaded when method="cellpose" is used
     
     def _check_cuda(self):
         """Check CUDA availability without importing torch at module level."""
@@ -181,13 +181,14 @@ class MicroSamTrainer:
         return temp_dir
     
     def _load_model(self, checkpoint_path=None, is_tiled=False):
-        """Lazy load predictor and segmenter."""
-        from micro_sam.automatic_segmentation import get_predictor_and_segmenter
-        
+        """Lazy load predictor and segmenter for microSAM."""
         # Reload if tiling state changed or model not loaded
         if (self.predictor is not None and self.segmenter is not None and 
             self.is_tiled == is_tiled):
             return self.predictor, self.segmenter
+        
+        # Import microSAM only when loading the model
+        from micro_sam.automatic_segmentation import get_predictor_and_segmenter
         
         # Determine checkpoint to use
         if checkpoint_path is None:
@@ -211,6 +212,87 @@ class MicroSamTrainer:
         self.is_tiled = is_tiled
         
         return self.predictor, self.segmenter
+
+    def _load_cellpose_model(self):
+        """Lazy load Cellpose model (cyto3)."""
+        from cellpose import models
+        
+        if self.cellpose_model is None:
+            # Initialize Cellpose model with cyto3 (latest cytoplasm model)
+            self.cellpose_model = models.CellposeModel(gpu=True, model_type='cyto3')
+            print("Cellpose cyto3 model loaded successfully")
+        
+        return self.cellpose_model
+    
+    def _segment_with_cellpose(self, image_2d: np.ndarray) -> np.ndarray:
+        """Run Cellpose segmentation on image.
+        
+        Args:
+            image_2d: Image array in (H, W) or (H, W, C) format
+            
+        Returns:
+            Instance segmentation mask with unique IDs per object
+        """
+        # Ensure Cellpose model is loaded
+        self._load_cellpose_model()
+        
+        # Cellpose expects (H, W) or (H, W, C) format
+        # If image is grayscale (H, W), Cellpose will handle it
+        # If image is RGB (H, W, 3), Cellpose will handle it
+        
+        # Run Cellpose segmentation
+        # channels=[0, 0] for grayscale (cytoplasm in first channel, no nucleus channel)
+        # diameter=None for automatic diameter detection
+        masks, flows, styles = self.cellpose_model.eval(
+            [image_2d],  # Cellpose expects a list of images
+            diameter=None,  # Auto-detect cell diameter
+            channels=[0, 0],  # Grayscale: cytoplasm in channel 0, no nucleus
+            flow_threshold=0.4,  # Default flow threshold
+            cellprob_threshold=0.0,  # Default cell probability threshold
+        )
+        
+        # Return the first mask (we only passed one image)
+        return masks[0]
+    
+    def _normalize_image_percentile(self, image_2d: np.ndarray) -> np.ndarray:
+        """Normalize image using contrast stretching (2nd-98th percentile).
+        
+        This improves contrast by rescaling the image to use the full intensity range
+        based on the 2nd and 98th percentiles, which helps with low-contrast images.
+        
+        Args:
+            image_2d: Image array in (H, W) or (H, W, C) format, uint8
+        
+        Returns:
+            Normalized image in same format, uint8
+        """
+        from skimage import exposure
+        
+        # Convert to float for processing
+        image_float = image_2d.astype(np.float64) / 255.0
+        
+        if len(image_float.shape) == 2:
+            # Grayscale: (H, W)
+            p2, p98 = np.percentile(image_float, (2, 98))
+            normalized = exposure.rescale_intensity(image_float, in_range=(p2, p98))
+            # Convert back to uint8
+            return (normalized * 255).astype(np.uint8)
+        
+        elif len(image_float.shape) == 3:
+            # RGB: (H, W, C) - apply normalization per channel
+            normalized_channels = []
+            for c in range(image_float.shape[2]):
+                channel = image_float[:, :, c]
+                p1, p99 = np.percentile(channel, (1, 99))
+                normalized_channel = exposure.rescale_intensity(channel, in_range=(p1, p99))
+                normalized_channels.append(normalized_channel)
+            
+            # Stack channels back together and convert to uint8
+            normalized = np.stack(normalized_channels, axis=2)
+            return (normalized * 255).astype(np.uint8)
+        
+        else:
+            raise ValueError(f"Unsupported image shape: {image_float.shape}")
 
     def _fit_blocking(self, images: List[np.ndarray], annotations: dict, n_epochs: int):
         """Blocking training function to run in a thread."""
@@ -924,25 +1006,33 @@ class MicroSamTrainer:
             False,
             description="If True, the input is treated as an embedding; otherwise, as a PNG image.",
         ),
+        method: str = Field(
+            "cellpose",
+            description="Segmentation method: 'microsam' or 'cellpose'. Default is 'cellpose'.",
+        ),
         tiling: bool = Field(
             False,
-            description="Whether to use tiling for large images. Default is False.",
+            description="Whether to use tiling for large images. Default is False. Only applicable for microSAM.",
         ),
         tile_shape: Any = Field(
             None,
-            description="Shape of tiles for tiled prediction (tuple of (height, width)). Default is (512, 512) when tiling is enabled.",
+            description="Shape of tiles for tiled prediction (tuple of (height, width)). Default is (512, 512) when tiling is enabled. Only applicable for microSAM.",
         ),
         halo: Any = Field(
             None,
-            description="Overlap of tiles for tiled prediction (tuple of (height, width)). Default is (128, 128) when tiling is enabled.",
+            description="Overlap of tiles for tiled prediction (tuple of (height, width)). Default is (128, 128) when tiling is enabled. Only applicable for microSAM.",
         ),
         min_cell_size: int = Field(
             100,
             description="Minimum cell size in pixels (area) to filter out small objects. Passed as 'min_size' to the segmenter's generate method. Default is 100.",
         ),
     ) -> Any:
-        from micro_sam.automatic_segmentation import automatic_instance_segmentation
+        # Import skimage for polygon extraction (used by both methods)
         from skimage.measure import find_contours, regionprops, approximate_polygon
+        
+        # Validate method parameter
+        if method not in ["microsam", "cellpose"]:
+            raise ValueError(f"Invalid method: {method}. Must be 'microsam' or 'cellpose'")
         
         # Input validation and decoding
         if embedding:
@@ -973,8 +1063,8 @@ class MicroSamTrainer:
             if not self._validate_image_format(image_array):
                 raise ValueError(f"Invalid decoded image format. Expected (C, H, W) where C in [1, 3], got {image_array.shape}")
         
-        # Set default tile_shape and halo if tiling is enabled
-        if tiling:
+        # Set default tile_shape and halo if tiling is enabled (only for microSAM)
+        if tiling and method == "microsam":
             if tile_shape is None:
                 tile_shape = (512, 512)
             else:
@@ -996,17 +1086,14 @@ class MicroSamTrainer:
             tile_shape = None
             halo = None
         
-        # Load model with appropriate tiling state
-        self._load_model(is_tiled=tiling)
-        
-        # Run automatic instance segmentation
+        # Run segmentation based on selected method
         if embedding:
             # For embeddings, we need to handle this differently
             # This is a simplified approach - in practice, you might need to reconstruct the image
             # or use the embedding directly with the segmenter
             raise NotImplementedError("Embedding-based segmentation not yet implemented")
         else:
-            # Convert image to the format expected by microSAM
+            # Convert image to the format expected by segmentation models
             if len(image_array.shape) == 3 and image_array.shape[0] in [1, 3]:
                 # Convert (C, H, W) to (H, W) for grayscale or (H, W, C) for RGB
                 if image_array.shape[0] == 1:
@@ -1016,23 +1103,44 @@ class MicroSamTrainer:
             else:
                 image_2d = image_array  # Assume already (H, W)
             
-            # Prepare kwargs for segmentation
-            kwargs = {
-                "predictor": self.predictor,
-                "segmenter": self.segmenter,
-                "input_path": image_2d,
-                "ndim": 2,
-                "verbose": False,  # Disable console output for speed
-                "min_size": min_cell_size,  # Pass min_size to segmenter.generate() via generate_kwargs
-            }
+            # Ensure image is uint8 for normalization
+            if image_2d.dtype != np.uint8:
+                if image_2d.max() <= 1.0:
+                    image_2d = (image_2d * 255).astype(np.uint8)
+                else:
+                    image_2d = image_2d.astype(np.uint8)
             
-            # Add tiling parameters if tiling is enabled
-            if tiling:
-                kwargs["tile_shape"] = tile_shape
-                kwargs["halo"] = halo
+            # Apply contrast stretching normalization (2nd-98th percentile)
+            image_2d_enhanced = self._normalize_image_percentile(image_2d)
             
-            # Run segmentation - returns instance segmentation with unique IDs per object
-            instances = automatic_instance_segmentation(**kwargs)
+            # Run segmentation with selected method using enhanced image
+            if method == "cellpose":
+                # Load Cellpose model and run segmentation
+                instances = self._segment_with_cellpose(image_2d_enhanced)
+            elif method == "microsam":
+                # Import microSAM only when needed
+                from micro_sam.automatic_segmentation import automatic_instance_segmentation
+                
+                # Load microSAM model with appropriate tiling state
+                self._load_model(is_tiled=tiling)
+                
+                # Prepare kwargs for microSAM segmentation
+                kwargs = {
+                    "predictor": self.predictor,
+                    "segmenter": self.segmenter,
+                    "input_path": image_2d_enhanced,
+                    "ndim": 2,
+                    "verbose": False,  # Disable console output for speed
+                    "min_size": min_cell_size,  # Pass min_size to segmenter.generate() via generate_kwargs
+                }
+                
+                # Add tiling parameters if tiling is enabled
+                if tiling:
+                    kwargs["tile_shape"] = tile_shape
+                    kwargs["halo"] = halo
+                
+                # Run segmentation - returns instance segmentation with unique IDs per object
+                instances = automatic_instance_segmentation(**kwargs)
             
             # Convert prediction to numpy array if it's not already
             if not isinstance(instances, np.ndarray):
@@ -1048,6 +1156,19 @@ class MicroSamTrainer:
                 else:
                     instances = np.array(instances)
             
+            # Save instance mask, raw image, and enhanced image to logs/segmentation folder
+            self._save_image_to_logs(instances, f"instance_mask", "segmentation")
+            self._save_image_to_logs(image_array, f"raw_image", "segmentation")
+            
+            # Convert enhanced image back to (C, H, W) format for saving
+            if len(image_2d_enhanced.shape) == 2:
+                # Grayscale: (H, W) -> (1, H, W)
+                image_enhanced_array = image_2d_enhanced[np.newaxis, :, :]
+            else:
+                # RGB: (H, W, C) -> (C, H, W)
+                image_enhanced_array = np.transpose(image_2d_enhanced, (2, 0, 1))
+            self._save_image_to_logs(image_enhanced_array, f"enhanced_image", "segmentation")
+            
             # Extract polygons for each instance object using regionprops
             # This directly processes the instance mask where each object has a unique ID
             props = regionprops(instances)
@@ -1062,6 +1183,7 @@ class MicroSamTrainer:
                 # Get the mask for this specific instance only
                 instance_mask = (instances == instance_id).astype(np.uint8)
                 
+
                 # Find contours for this instance with high connectivity for detailed boundaries
                 # fully_connected='high' ensures we capture all boundary pixels
                 contours = find_contours(instance_mask, level=0.5, fully_connected='high')
@@ -1103,7 +1225,7 @@ class MicroSamTrainer:
                 image_array,
                 visualization,
                 label1="Input",
-                label2="Polygons"
+                label2=f"Polygons ({method})"
             )
             
             # Save visualization as JPEG to logs/segmentation folder
@@ -1115,7 +1237,7 @@ class MicroSamTrainer:
             os.makedirs(segmentation_logs_dir, exist_ok=True)
             
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-            log_filename = f"segmentation_{timestamp}.jpg"
+            log_filename = f"segmentation_{method}_{timestamp}.jpg"
             log_filepath = os.path.join(segmentation_logs_dir, log_filename)
             
             # Save as JPEG (quality=95 for good balance)
@@ -1128,10 +1250,11 @@ class MicroSamTrainer:
 if __name__ == "__main__":
     import asyncio
 
-    micro_sam_trainer = MicroSamTrainer.func_or_class()
+    cell_segmenter = CellSegmenter.func_or_class()
 
     async def test():
-        response = await micro_sam_trainer.start_fit()
+        response = await cell_segmenter.start_fit()
         print(response)
 
     asyncio.run(test())
+
