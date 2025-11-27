@@ -249,6 +249,7 @@ class CellSegmenter:
             channels=[0, 0],  # Grayscale: cytoplasm in channel 0, no nucleus
             flow_threshold=0.4,  # Default flow threshold
             cellprob_threshold=0.0,  # Default cell probability threshold
+            batch_size=1,  # Explicit batch size for single image
         )
         
         # Return the first mask (we only passed one image)
@@ -1103,20 +1104,21 @@ class CellSegmenter:
             else:
                 image_2d = image_array  # Assume already (H, W)
             
-            # Ensure image is uint8 for normalization
+            # Ensure image is uint8
             if image_2d.dtype != np.uint8:
                 if image_2d.max() <= 1.0:
                     image_2d = (image_2d * 255).astype(np.uint8)
                 else:
                     image_2d = image_2d.astype(np.uint8)
             
-            # Apply contrast stretching normalization (2nd-98th percentile)
-            image_2d_enhanced = self._normalize_image_percentile(image_2d)
+            # Normalization is handled on client side - using original image
+            # # Apply contrast stretching normalization (2nd-98th percentile)
+            # image_2d_enhanced = self._normalize_image_percentile(image_2d)
             
-            # Run segmentation with selected method using enhanced image
+            # Run segmentation with selected method using original image
             if method == "cellpose":
                 # Load Cellpose model and run segmentation
-                instances = self._segment_with_cellpose(image_2d_enhanced)
+                instances = self._segment_with_cellpose(image_2d)
             elif method == "microsam":
                 # Import microSAM only when needed
                 from micro_sam.automatic_segmentation import automatic_instance_segmentation
@@ -1128,7 +1130,7 @@ class CellSegmenter:
                 kwargs = {
                     "predictor": self.predictor,
                     "segmenter": self.segmenter,
-                    "input_path": image_2d_enhanced,
+                    "input_path": image_2d,
                     "ndim": 2,
                     "verbose": False,  # Disable console output for speed
                     "min_size": min_cell_size,  # Pass min_size to segmenter.generate() via generate_kwargs
@@ -1156,18 +1158,19 @@ class CellSegmenter:
                 else:
                     instances = np.array(instances)
             
-            # Save instance mask, raw image, and enhanced image to logs/segmentation folder
+            # Save instance mask and raw image to logs/segmentation folder
             self._save_image_to_logs(instances, f"instance_mask", "segmentation")
             self._save_image_to_logs(image_array, f"raw_image", "segmentation")
             
-            # Convert enhanced image back to (C, H, W) format for saving
-            if len(image_2d_enhanced.shape) == 2:
-                # Grayscale: (H, W) -> (1, H, W)
-                image_enhanced_array = image_2d_enhanced[np.newaxis, :, :]
-            else:
-                # RGB: (H, W, C) -> (C, H, W)
-                image_enhanced_array = np.transpose(image_2d_enhanced, (2, 0, 1))
-            self._save_image_to_logs(image_enhanced_array, f"enhanced_image", "segmentation")
+            # Normalization is handled on client side - enhanced image saving commented out
+            # # Convert enhanced image back to (C, H, W) format for saving
+            # if len(image_2d_enhanced.shape) == 2:
+            #     # Grayscale: (H, W) -> (1, H, W)
+            #     image_enhanced_array = image_2d_enhanced[np.newaxis, :, :]
+            # else:
+            #     # RGB: (H, W, C) -> (C, H, W)
+            #     image_enhanced_array = np.transpose(image_2d_enhanced, (2, 0, 1))
+            # self._save_image_to_logs(image_enhanced_array, f"enhanced_image", "segmentation")
             
             # Extract polygons for each instance object using regionprops
             # This directly processes the instance mask where each object has a unique ID
@@ -1228,7 +1231,7 @@ class CellSegmenter:
                 label2=f"Polygons ({method})"
             )
             
-            # Save visualization as JPEG to logs/segmentation folder
+            #Save visualization as JPEG to logs/segmentation folder
             import os
             from datetime import datetime
             from PIL import Image
