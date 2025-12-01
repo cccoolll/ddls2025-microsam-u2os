@@ -41,10 +41,6 @@ class CellSegmenter:
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         self.current_checkpoint = None
         
-        # Initialize logs directory
-        self.logs_dir = "/home/scheng/workspace/ddls2025-microsam-u2os/logs"
-        os.makedirs(self.logs_dir, exist_ok=True)
-        
         # NOTE: Models are loaded lazily on first use to avoid unnecessary imports
         # - microSAM: loaded when method="microsam" is used
         # - Cellpose: loaded when method="cellpose" is used
@@ -254,46 +250,6 @@ class CellSegmenter:
         
         # Return the first mask (we only passed one image)
         return masks[0]
-    
-    def _normalize_image_percentile(self, image_2d: np.ndarray) -> np.ndarray:
-        """Normalize image using contrast stretching (2nd-98th percentile).
-        
-        This improves contrast by rescaling the image to use the full intensity range
-        based on the 2nd and 98th percentiles, which helps with low-contrast images.
-        
-        Args:
-            image_2d: Image array in (H, W) or (H, W, C) format, uint8
-        
-        Returns:
-            Normalized image in same format, uint8
-        """
-        from skimage import exposure
-        
-        # Convert to float for processing
-        image_float = image_2d.astype(np.float64) / 255.0
-        
-        if len(image_float.shape) == 2:
-            # Grayscale: (H, W)
-            p2, p98 = np.percentile(image_float, (2, 98))
-            normalized = exposure.rescale_intensity(image_float, in_range=(p2, p98))
-            # Convert back to uint8
-            return (normalized * 255).astype(np.uint8)
-        
-        elif len(image_float.shape) == 3:
-            # RGB: (H, W, C) - apply normalization per channel
-            normalized_channels = []
-            for c in range(image_float.shape[2]):
-                channel = image_float[:, :, c]
-                p1, p99 = np.percentile(channel, (1, 99))
-                normalized_channel = exposure.rescale_intensity(channel, in_range=(p1, p99))
-                normalized_channels.append(normalized_channel)
-            
-            # Stack channels back together and convert to uint8
-            normalized = np.stack(normalized_channels, axis=2)
-            return (normalized * 255).astype(np.uint8)
-        
-        else:
-            raise ValueError(f"Unsupported image shape: {image_float.shape}")
 
     def _fit_blocking(self, images: List[np.ndarray], annotations: dict, n_epochs: int):
         """Blocking training function to run in a thread."""
@@ -575,9 +531,6 @@ class CellSegmenter:
         if self.predictor is None:
             self._load_model(is_tiled=False)
         
-        # Log input image to logs folder
-        self._save_image_to_logs(image, "input_image", subfolder="encoding")
-        
         # Convert image to the format expected by SAM
         if len(image.shape) == 3 and image.shape[0] in [1, 3]:
             # Convert (C, H, W) to (H, W) for grayscale or (H, W, C) for RGB
@@ -719,283 +672,6 @@ class CellSegmenter:
         except Exception as e:
             raise ValueError(f"Failed to encode segmentation to PNG: {str(e)}")
     
-    def _save_image_to_logs(self, image: np.ndarray, filename_prefix: str, subfolder: str = "") -> str:
-        """Save image to logs folder with timestamp as PNG.
-        
-        Args:
-            image: Image array in any format (C, H, W), (H, W), or (H, W, C)
-            filename_prefix: Prefix for the filename (e.g., 'input', 'segmentation', 'encoded')
-            subfolder: Optional subfolder within logs (e.g., 'segmentation', 'encoding')
-        
-        Returns:
-            Path to saved image file
-        """
-        import os
-        from datetime import datetime
-        from PIL import Image
-        
-        # Create subfolder if specified
-        save_dir = os.path.join(self.logs_dir, subfolder) if subfolder else self.logs_dir
-        os.makedirs(save_dir, exist_ok=True)
-        
-        # Generate timestamp for unique filename
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]  # Include milliseconds
-        filename = f"{filename_prefix}_{timestamp}.png"
-        filepath = os.path.join(save_dir, filename)
-        
-        # Convert image to 2D format for saving
-        if len(image.shape) == 3:
-            if image.shape[0] in [1, 3]:
-                # (C, H, W) format
-                if image.shape[0] == 1:
-                    image_2d = image[0]  # (H, W)
-                else:
-                    image_2d = np.transpose(image, (1, 2, 0))  # (H, W, C)
-            else:
-                # Assume (H, W, C) format
-                image_2d = image
-        else:
-            # Already 2D
-            image_2d = image
-        
-        # Normalize to uint8 if needed
-        if image_2d.dtype != np.uint8:
-            if image_2d.max() <= 1.0:
-                image_2d = (image_2d * 255).astype(np.uint8)
-            elif image_2d.max() <= 255:
-                image_2d = image_2d.astype(np.uint8)
-            else:
-                # Normalize to 0-255 range
-                if image_2d.max() > image_2d.min():
-                    image_2d = ((image_2d - image_2d.min()) / 
-                               (image_2d.max() - image_2d.min()) * 255).astype(np.uint8)
-                else:
-                    image_2d = np.zeros_like(image_2d, dtype=np.uint8)
-        
-        # Save image as PNG (lossless format)
-        try:
-            # Convert to PIL Image
-            if len(image_2d.shape) == 2:
-                # Grayscale: (H, W)
-                pil_image = Image.fromarray(image_2d, mode='L')
-            elif len(image_2d.shape) == 3:
-                # RGB: (H, W, C)
-                if image_2d.shape[2] == 3:
-                    pil_image = Image.fromarray(image_2d, mode='RGB')
-                elif image_2d.shape[2] == 1:
-                    pil_image = Image.fromarray(image_2d[:, :, 0], mode='L')
-                else:
-                    pil_image = Image.fromarray(image_2d[:, :, :3], mode='RGB')
-            else:
-                pil_image = Image.fromarray(image_2d, mode='L')
-            
-            # Save as PNG (lossless)
-            pil_image.save(filepath, format='PNG')
-            return filepath
-        except Exception as e:
-            # Log error but don't fail the operation
-            import logging
-            logging.warning(f"Failed to save image to logs: {str(e)}")
-            return ""
-    
-    def _combine_images_side_by_side(self, image1: np.ndarray, image2: np.ndarray, 
-                                     label1: str = "Input", label2: str = "Segmentation") -> np.ndarray:
-        """Combine two images side-by-side with labels for comparison.
-        
-        Args:
-            image1: First image array
-            image2: Second image array
-            label1: Label for first image (default: "Input")
-            label2: Label for second image (default: "Segmentation")
-        
-        Returns:
-            Combined image as numpy array (H, W, C) in RGB format
-        """
-        from PIL import Image, ImageDraw, ImageFont
-        
-        # Normalize both images to (H, W) or (H, W, C) format
-        def normalize_to_2d(img):
-            if len(img.shape) == 3:
-                if img.shape[0] in [1, 3]:
-                    # (C, H, W) format
-                    if img.shape[0] == 1:
-                        return img[0]  # (H, W)
-                    else:
-                        return np.transpose(img, (1, 2, 0))  # (H, W, C)
-            return img  # Already in correct format
-        
-        img1_2d = normalize_to_2d(image1)
-        img2_2d = normalize_to_2d(image2)
-        
-        # Ensure both images have same height (resize if needed)
-        h1, w1 = img1_2d.shape[:2]
-        h2, w2 = img2_2d.shape[:2]
-        
-        # Use the maximum height
-        max_h = max(h1, h2)
-        
-        # Resize images to same height if needed
-        if h1 != max_h or h2 != max_h:
-            from PIL import Image as PILImage
-            if len(img1_2d.shape) == 2:
-                pil1 = PILImage.fromarray(img1_2d, mode='L').resize((w1, max_h), PILImage.Resampling.LANCZOS)
-            else:
-                pil1 = PILImage.fromarray(img1_2d).resize((w1, max_h), PILImage.Resampling.LANCZOS)
-            img1_2d = np.array(pil1)
-            
-            if len(img2_2d.shape) == 2:
-                pil2 = PILImage.fromarray(img2_2d, mode='L').resize((w2, max_h), PILImage.Resampling.LANCZOS)
-            else:
-                pil2 = PILImage.fromarray(img2_2d).resize((w2, max_h), PILImage.Resampling.LANCZOS)
-            img2_2d = np.array(pil2)
-        
-        # Normalize to uint8 for display
-        def normalize_to_uint8(img):
-            if img.dtype != np.uint8:
-                if img.max() <= 1.0:
-                    img = (img * 255).astype(np.uint8)
-                elif img.max() <= 255:
-                    img = img.astype(np.uint8)
-                else:
-                    if img.max() > img.min():
-                        img = ((img - img.min()) / (img.max() - img.min()) * 255).astype(np.uint8)
-                    else:
-                        img = np.zeros_like(img, dtype=np.uint8)
-            return img
-        
-        img1_2d = normalize_to_uint8(img1_2d)
-        img2_2d = normalize_to_uint8(img2_2d)
-        
-        # Convert grayscale to RGB if needed
-        if len(img1_2d.shape) == 2:
-            img1_rgb = np.stack([img1_2d] * 3, axis=-1)
-        elif img1_2d.shape[2] == 1:
-            img1_rgb = np.repeat(img1_2d, 3, axis=2)
-        else:
-            img1_rgb = img1_2d[:, :, :3]  # Take first 3 channels if more
-        
-        if len(img2_2d.shape) == 2:
-            # For segmentation masks, use color mapping for better visibility
-            img2_rgb = np.zeros((img2_2d.shape[0], img2_2d.shape[1], 3), dtype=np.uint8)
-            # Create a colored overlay for the segmentation mask
-            mask_normalized = img2_2d / 255.0 if img2_2d.max() > 0 else img2_2d
-            # Use a color map (green overlay for segmentation)
-            img2_rgb[:, :, 1] = (mask_normalized * 255).astype(np.uint8)  # Green channel
-            # Also show original values in grayscale
-            img2_rgb[:, :, 0] = img2_2d
-            img2_rgb[:, :, 2] = img2_2d
-        elif img2_2d.shape[2] == 1:
-            mask_normalized = img2_2d[:, :, 0] / 255.0 if img2_2d.max() > 0 else img2_2d[:, :, 0]
-            img2_rgb = np.zeros((img2_2d.shape[0], img2_2d.shape[1], 3), dtype=np.uint8)
-            img2_rgb[:, :, 1] = (mask_normalized * 255).astype(np.uint8)
-            img2_rgb[:, :, 0] = img2_2d[:, :, 0]
-            img2_rgb[:, :, 2] = img2_2d[:, :, 0]
-        else:
-            img2_rgb = img2_2d[:, :, :3]
-        
-        # Combine images side-by-side
-        combined_width = img1_rgb.shape[1] + img2_rgb.shape[1]
-        combined_height = img1_rgb.shape[0]
-        combined = np.zeros((combined_height, combined_width, 3), dtype=np.uint8)
-        
-        combined[:, :img1_rgb.shape[1], :] = img1_rgb
-        combined[:, img1_rgb.shape[1]:, :] = img2_rgb
-        
-        # Add labels using PIL
-        pil_combined = Image.fromarray(combined, mode='RGB')
-        draw = ImageDraw.Draw(pil_combined)
-        
-        # Try to use a default font, fallback to basic if not available
-        try:
-            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 20)
-        except:
-            try:
-                font = ImageFont.truetype("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf", 20)
-            except:
-                font = ImageFont.load_default()
-        
-        # Add labels at the top of each image
-        text_color = (255, 255, 0)  # Yellow text
-        draw.text((10, 10), label1, fill=text_color, font=font)
-        draw.text((img1_rgb.shape[1] + 10, 10), label2, fill=text_color, font=font)
-        
-        return np.array(pil_combined)
-    
-    def _draw_polygons_on_image(self, image: np.ndarray, polygons_list: List[Dict]) -> np.ndarray:
-        """Draw polygons on an image with different colors for each object.
-        
-        Args:
-            image: Input image array in (H, W) or (H, W, C) format
-            polygons_list: List of polygon dictionaries with 'id' and 'polygons' keys
-            
-        Returns:
-            Image with polygons drawn as RGB array (H, W, 3)
-        """
-        from PIL import Image, ImageDraw
-        import colorsys
-        
-        # Normalize image to (H, W) or (H, W, C) format
-        if len(image.shape) == 3 and image.shape[0] in [1, 3]:
-            if image.shape[0] == 1:
-                image_2d = image[0]  # (H, W)
-            else:
-                image_2d = np.transpose(image, (1, 2, 0))  # (H, W, C)
-        else:
-            image_2d = image
-        
-        # Normalize to uint8
-        if image_2d.dtype != np.uint8:
-            if image_2d.max() <= 1.0:
-                image_2d = (image_2d * 255).astype(np.uint8)
-            elif image_2d.max() <= 255:
-                image_2d = image_2d.astype(np.uint8)
-            else:
-                if image_2d.max() > image_2d.min():
-                    image_2d = ((image_2d - image_2d.min()) / 
-                               (image_2d.max() - image_2d.min()) * 255).astype(np.uint8)
-                else:
-                    image_2d = np.zeros_like(image_2d, dtype=np.uint8)
-        
-        # Convert to RGB
-        if len(image_2d.shape) == 2:
-            image_rgb = np.stack([image_2d] * 3, axis=-1)
-        elif image_2d.shape[2] == 1:
-            image_rgb = np.repeat(image_2d, 3, axis=2)
-        else:
-            image_rgb = image_2d[:, :, :3].copy()
-        
-        # Create PIL image for drawing
-        pil_image = Image.fromarray(image_rgb, mode='RGB')
-        draw = ImageDraw.Draw(pil_image)
-        
-        # Generate distinct colors for each object
-        num_objects = len(polygons_list)
-        colors = []
-        for i in range(num_objects):
-            # Generate colors using HSV color space for better distinction
-            hue = i / max(num_objects, 1)  # Distribute hues evenly
-            saturation = 0.8
-            value = 1.0
-            rgb = colorsys.hsv_to_rgb(hue, saturation, value)
-            colors.append(tuple(int(c * 255) for c in rgb))
-        
-        # Draw polygons for each object
-        for obj_idx, obj_data in enumerate(polygons_list):
-            color = colors[obj_idx % len(colors)]
-            
-            # Draw each polygon for this object
-            for polygon in obj_data['polygons']:
-                if len(polygon) < 3:  # Need at least 3 points for a polygon
-                    continue
-                
-                # Convert polygon points to tuple format for PIL
-                points = [(int(p[0]), int(p[1])) for p in polygon]
-                
-                # Draw polygon outline (thicker line for visibility)
-                draw.polygon(points, outline=color, width=2)
-        
-        return np.array(pil_image)
-
     @schema_method
     async def segment_all(
         self,
@@ -1113,7 +789,6 @@ class CellSegmenter:
             
             # Normalization is handled on client side - using original image
             # # Apply contrast stretching normalization (2nd-98th percentile)
-            # image_2d_enhanced = self._normalize_image_percentile(image_2d)
             
             # Run segmentation with selected method using original image
             if method == "cellpose":
@@ -1157,20 +832,6 @@ class CellSegmenter:
                         raise ValueError(f"Could not find segmentation mask in prediction dict. Keys: {list(instances.keys())}")
                 else:
                     instances = np.array(instances)
-            
-            # Save instance mask and raw image to logs/segmentation folder
-            self._save_image_to_logs(instances, f"instance_mask", "segmentation")
-            self._save_image_to_logs(image_array, f"raw_image", "segmentation")
-            
-            # Normalization is handled on client side - enhanced image saving commented out
-            # # Convert enhanced image back to (C, H, W) format for saving
-            # if len(image_2d_enhanced.shape) == 2:
-            #     # Grayscale: (H, W) -> (1, H, W)
-            #     image_enhanced_array = image_2d_enhanced[np.newaxis, :, :]
-            # else:
-            #     # RGB: (H, W, C) -> (C, H, W)
-            #     image_enhanced_array = np.transpose(image_2d_enhanced, (2, 0, 1))
-            # self._save_image_to_logs(image_enhanced_array, f"enhanced_image", "segmentation")
             
             # Extract polygons for each instance object using regionprops
             # This directly processes the instance mask where each object has a unique ID
@@ -1220,35 +881,12 @@ class CellSegmenter:
                     "bbox": [int(bbox[1]), int(bbox[0]), int(bbox[3]), int(bbox[2])]  # [x_min, y_min, x_max, y_max]
                 })
             
-            # Create visualization: draw polygons on image
-            visualization = self._draw_polygons_on_image(image_array, polygons_list)
-            
-            # Combine input image (left) with visualization (right)
-            combined_image = self._combine_images_side_by_side(
-                image_array,
-                visualization,
-                label1="Input",
-                label2=f"Polygons ({method})"
-            )
-            
-            #Save visualization as JPEG to logs/segmentation folder
-            import os
-            from datetime import datetime
-            from PIL import Image
-            
-            segmentation_logs_dir = os.path.join(self.logs_dir, "segmentation")
-            os.makedirs(segmentation_logs_dir, exist_ok=True)
-            
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-            log_filename = f"segmentation_{method}_{timestamp}.jpg"
-            log_filepath = os.path.join(segmentation_logs_dir, log_filename)
-            
-            # Save as JPEG (quality=95 for good balance)
-            pil_combined = Image.fromarray(combined_image, mode='RGB')
-            pil_combined.save(log_filepath, format='JPEG', quality=95)
-            
-            # Return list of polygons for all instances
-            return polygons_list
+            # Return both mask and polygons
+            # Mask is returned as numpy array to preserve exact uint32 instance IDs (critical for medical/industrial use)
+            return {
+                "polygons": polygons_list,
+                "mask": instances  # Numpy array with exact instance segmentation mask (preserves uint32 dtype and all instance IDs)
+            }
 
 if __name__ == "__main__":
     import asyncio

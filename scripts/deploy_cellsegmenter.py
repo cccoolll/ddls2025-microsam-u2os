@@ -24,7 +24,7 @@ async def deploy_cellsegmenter():
     # Songtao's workspace
     workspace = "agent-lens"
     # Get the worker service
-    worker = await server.get_service(f"{workspace}/microsam:bioengine-worker")
+    worker = await server.get_service(f"{workspace}/cell_segmenter:bioengine-worker")
     
     print("Loading CellSegmenter service files...")
     
