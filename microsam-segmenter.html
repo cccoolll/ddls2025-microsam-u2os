@@ -1,0 +1,827 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MicroSAM Cell Segmentation</title>
+    <!-- Load hypha-rpc from CDN in head section -->
+    <script src="https://cdn.jsdelivr.net/npm/hypha-rpc@0.20.85/dist/hypha-rpc-websocket.min.js" 
+            onerror="console.error('Failed to load hypha-rpc script from CDN')"
+            onload="console.log('hypha-rpc script tag loaded')"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            overflow: hidden;
+        }
+
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+            position: relative;
+        }
+
+        .header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+            font-weight: 600;
+        }
+
+        .header p {
+            font-size: 1.1em;
+            opacity: 0.9;
+        }
+
+        .status-indicator {
+            position: absolute;
+            top: 30px;
+            right: 30px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            background: rgba(255, 255, 255, 0.2);
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-size: 0.9em;
+        }
+
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #ff4444;
+            animation: pulse 2s infinite;
+        }
+
+        .status-dot.connected {
+            background: #44ff44;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .content {
+            padding: 30px;
+        }
+
+        .upload-section {
+            background: #f8f9fa;
+            border: 2px dashed #dee2e6;
+            border-radius: 8px;
+            padding: 40px;
+            text-align: center;
+            margin-bottom: 30px;
+            transition: all 0.3s ease;
+        }
+
+        .upload-section:hover {
+            border-color: #667eea;
+            background: #f0f2ff;
+        }
+
+        .upload-section.dragover {
+            border-color: #667eea;
+            background: #e8ebff;
+            transform: scale(1.02);
+        }
+
+        .file-input-wrapper {
+            position: relative;
+            display: inline-block;
+        }
+
+        .file-input {
+            display: none;
+        }
+
+        .file-input-label {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 12px 30px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 1.1em;
+            font-weight: 500;
+            transition: transform 0.2s ease;
+            display: inline-block;
+        }
+
+        .file-input-label:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+        }
+
+        .preview-section {
+            margin-top: 20px;
+            display: none;
+        }
+
+        .preview-image {
+            max-width: 300px;
+            max-height: 300px;
+            border-radius: 8px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+            margin: 20px auto;
+            display: block;
+        }
+
+        .control-section {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+
+        .segment-button {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 15px 50px;
+            border-radius: 6px;
+            font-size: 1.2em;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
+        }
+
+        .segment-button:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(102, 126, 234, 0.6);
+        }
+
+        .segment-button:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+
+        .loading-spinner {
+            display: none;
+            margin: 20px auto;
+            width: 50px;
+            height: 50px;
+            border: 5px solid #f3f3f3;
+            border-top: 5px solid #667eea;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .loading-spinner.active {
+            display: block;
+        }
+
+        .results-section {
+            display: none;
+        }
+
+        .results-section.active {
+            display: block;
+        }
+
+        .stats-bar {
+            display: flex;
+            justify-content: center;
+            gap: 40px;
+            margin-bottom: 30px;
+            padding: 20px;
+            background: #f8f9fa;
+            border-radius: 8px;
+        }
+
+        .stat-item {
+            text-align: center;
+        }
+
+        .stat-value {
+            font-size: 2em;
+            font-weight: 700;
+            color: #667eea;
+            display: block;
+        }
+
+        .stat-label {
+            font-size: 0.9em;
+            color: #6c757d;
+            margin-top: 5px;
+        }
+
+        .visualization-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 30px;
+            margin-bottom: 30px;
+        }
+
+        .canvas-container {
+            background: #f8f9fa;
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+        }
+
+        .canvas-title {
+            font-size: 1.2em;
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 15px;
+            text-align: center;
+        }
+
+        .canvas-wrapper {
+            background: white;
+            border-radius: 4px;
+            overflow: hidden;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 400px;
+        }
+
+        canvas {
+            max-width: 100%;
+            height: auto;
+            display: block;
+        }
+
+        .error-message {
+            display: none;
+            background: #ff4444;
+            color: white;
+            padding: 15px;
+            border-radius: 6px;
+            margin: 20px 0;
+            text-align: center;
+        }
+
+        .error-message.active {
+            display: block;
+        }
+
+        @media (max-width: 768px) {
+            .visualization-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .header h1 {
+                font-size: 1.8em;
+            }
+
+            .status-indicator {
+                position: static;
+                margin-top: 15px;
+                justify-content: center;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🔬 MicroSAM Cell Segmentation</h1>
+            <p>Automatic cell segmentation using fine-tuned microSAM model</p>
+            <div class="status-indicator">
+                <div class="status-dot" id="statusDot"></div>
+                <span id="statusText">Connecting...</span>
+            </div>
+        </div>
+
+        <div class="content">
+            <!-- Upload Section -->
+            <div class="upload-section" id="uploadSection">
+                <h2 style="margin-bottom: 20px; color: #333;">Upload Microscopy Image</h2>
+                <div class="file-input-wrapper">
+                    <input type="file" id="fileInput" class="file-input" accept="image/*">
+                    <label for="fileInput" class="file-input-label">Choose Image</label>
+                </div>
+                <p style="margin-top: 15px; color: #6c757d;">or drag and drop an image here</p>
+                
+                <div class="preview-section" id="previewSection">
+                    <img id="previewImage" class="preview-image" alt="Preview">
+                    <p id="fileName" style="color: #6c757d; margin-top: 10px;"></p>
+                </div>
+            </div>
+
+            <!-- Error Message -->
+            <div class="error-message" id="errorMessage"></div>
+
+            <!-- Login Section -->
+            <div id="loginSection" style="display: none; text-align: center; margin: 20px 0; padding: 20px; background: #f8f9fa; border-radius: 8px;">
+                <h3 style="color: #333; margin-bottom: 15px;">🔐 Login Required</h3>
+                <p style="color: #6c757d; margin-bottom: 15px;">Please log in to access the cell segmentation service</p>
+                <button id="loginButton" class="segment-button" style="background: linear-gradient(135deg, #28a745 0%, #20c997 100%);">
+                    Click Here to Login
+                </button>
+            </div>
+
+            <!-- Control Section -->
+            <div class="control-section">
+                <button id="segmentButton" class="segment-button" disabled>Segment Cells</button>
+                <div class="loading-spinner" id="loadingSpinner"></div>
+            </div>
+
+            <!-- Results Section -->
+            <div class="results-section" id="resultsSection">
+                <div class="stats-bar">
+                    <div class="stat-item">
+                        <span class="stat-value" id="cellCount">0</span>
+                        <span class="stat-label">Cells Detected</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-value" id="processingTime">0.0s</span>
+                        <span class="stat-label">Processing Time</span>
+                    </div>
+                </div>
+
+                <div class="visualization-grid">
+                    <div class="canvas-container">
+                        <div class="canvas-title">Instance Mask</div>
+                        <div class="canvas-wrapper">
+                            <canvas id="maskCanvas"></canvas>
+                        </div>
+                    </div>
+
+                    <div class="canvas-container">
+                        <div class="canvas-title">Polygon Overlay</div>
+                        <div class="canvas-wrapper">
+                            <canvas id="overlayCanvas"></canvas>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Application state
+        let hyphaClient = null;
+        let cellSegmenterService = null;
+        let uploadedImageBase64 = null;
+        let uploadedImageElement = null;
+
+        // DOM elements
+        const fileInput = document.getElementById('fileInput');
+        const uploadSection = document.getElementById('uploadSection');
+        const previewSection = document.getElementById('previewSection');
+        const previewImage = document.getElementById('previewImage');
+        const fileName = document.getElementById('fileName');
+        const loginSection = document.getElementById('loginSection');
+        const loginButton = document.getElementById('loginButton');
+        const segmentButton = document.getElementById('segmentButton');
+        const loadingSpinner = document.getElementById('loadingSpinner');
+        const resultsSection = document.getElementById('resultsSection');
+        const errorMessage = document.getElementById('errorMessage');
+        const statusDot = document.getElementById('statusDot');
+        const statusText = document.getElementById('statusText');
+        const cellCount = document.getElementById('cellCount');
+        const processingTime = document.getElementById('processingTime');
+        const maskCanvas = document.getElementById('maskCanvas');
+        const overlayCanvas = document.getElementById('overlayCanvas');
+
+        // Store login URL
+        let loginUrl = null;
+
+        // Login callback - shows login button instead of auto-opening popup
+        const login_callback = (context) => {
+            console.log("[login_callback] Invoked. Login URL:", context.login_url);
+            loginUrl = context.login_url;
+            
+            // Show login section
+            loginSection.style.display = 'block';
+            statusText.textContent = 'Login Required';
+        }
+
+        // Login button click handler
+        loginButton.addEventListener('click', () => {
+            if (loginUrl) {
+                console.log("[loginButton] Opening login URL:", loginUrl);
+                window.open(loginUrl, '_blank');
+            }
+        });
+
+        // Check if token is expired
+        const isTokenExpired = (token) => {
+            try {
+                if (!token || typeof token !== 'string') {
+                    console.log("[isTokenExpired] Invalid token format");
+                    return true;
+                }
+                
+                const parts = token.split('.');
+                if (parts.length !== 3) {
+                    console.log("[isTokenExpired] Token does not have 3 parts (invalid JWT format)");
+                    return true;
+                }
+                
+                const payload = JSON.parse(atob(parts[1]));
+                if (!payload.exp) {
+                    console.log("[isTokenExpired] Token has no expiration field");
+                    return true;
+                }
+                
+                const expired = Date.now() >= (payload.exp * 1000);
+                console.log("[isTokenExpired] Token check. Expired:", expired);
+                return expired;
+            } catch (error) {
+                console.error("[isTokenExpired] Error parsing token:", error);
+                return true; // Treat invalid tokens as expired
+            }
+        }
+
+        // Login and get token
+        const login = async () => {
+            const serverUrl = 'https://hypha.aicell.io';
+            console.log(`[login] Starting login process. Server URL: ${serverUrl}`);
+            let token = localStorage.getItem("token");
+            console.log("[login] Token from localStorage:", token ? "Exists" : "Not Found");
+            
+            if (token && !isTokenExpired(token)) {
+                console.log("[login] Using existing valid token.");
+                return token;
+            }
+            
+            console.log("[login] Existing token is invalid or not found. Requesting new token...");
+            token = await hyphaWebsocketClient.login({
+                server_url: serverUrl,
+                login_callback: login_callback,
+            });
+            console.log("[login] New token obtained:", token);
+            localStorage.setItem("token", token);
+            return token;
+        }
+
+        // Wait for hypha-rpc library to load
+        async function waitForHyphaRPC() {
+            return new Promise((resolve, reject) => {
+                let attempts = 0;
+                const maxAttempts = 100; // Wait up to 10 seconds
+                
+                const checkLoaded = () => {
+                    // Check for hyphaWebsocketClient (the actual exported function)
+                    if (typeof hyphaWebsocketClient !== 'undefined' || typeof window.hyphaWebsocketClient !== 'undefined') {
+                        console.log('hypha-rpc library loaded successfully');
+                        // Create an alias for backward compatibility
+                        if (typeof connectToServer === 'undefined') {
+                            window.connectToServer = window.hyphaWebsocketClient.connectToServer;
+                        }
+                        resolve();
+                    } else if (attempts >= maxAttempts) {
+                        console.error('Gave up after', attempts * 100, 'ms');
+                        console.error('hyphaWebsocketClient not found');
+                        reject(new Error('hypha-rpc library failed to load. Please check your internet connection and browser console for details.'));
+                    } else {
+                        attempts++;
+                        setTimeout(checkLoaded, 100);
+                    }
+                };
+                
+                checkLoaded();
+            });
+        }
+
+        // Initialize application
+        async function init() {
+            try {
+                // Wait for hypha-rpc library to load
+                statusText.textContent = 'Loading library...';
+                await waitForHyphaRPC();
+                
+                // Login and get token
+                statusText.textContent = 'Logging in...';
+                console.log('[init] Starting login...');
+                const token = await login();
+                console.log('[init] Login successful, token obtained');
+                
+                // Connect to server with token
+                statusText.textContent = 'Connecting...';
+                console.log('[init] Connecting to hypha server...');
+                
+                // Use the correct API - hyphaWebsocketClient.connectToServer
+                const connectFunc = window.connectToServer || window.hyphaWebsocketClient.connectToServer;
+                hyphaClient = await connectFunc({
+                    server_url: 'https://hypha.aicell.io',
+                    token: token
+                });
+                
+                console.log('[init] Getting cell-segmenter service...');
+                // Get cell-segmenter service from agent-lens workspace
+                cellSegmenterService = await hyphaClient.getService('agent-lens/cell-segmenter');
+                
+                // Hide login section and update status
+                loginSection.style.display = 'none';
+                statusDot.classList.add('connected');
+                statusText.textContent = 'Connected';
+                
+                console.log('[init] Successfully connected to cell-segmenter service');
+            } catch (error) {
+                console.error('[init] Failed to connect:', error);
+                statusText.textContent = 'Connection Failed';
+                showError('Failed to connect to segmentation service: ' + error.message);
+            }
+        }
+
+        // File input handler
+        fileInput.addEventListener('change', handleFileSelect);
+
+        function handleFileSelect(event) {
+            const file = event.target.files[0];
+            if (file) {
+                processFile(file);
+            }
+        }
+
+        // Drag and drop handlers
+        uploadSection.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            uploadSection.classList.add('dragover');
+        });
+
+        uploadSection.addEventListener('dragleave', () => {
+            uploadSection.classList.remove('dragover');
+        });
+
+        uploadSection.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadSection.classList.remove('dragover');
+            
+            const file = e.dataTransfer.files[0];
+            if (file && file.type.startsWith('image/')) {
+                processFile(file);
+            }
+        });
+
+        // Process uploaded file
+        function processFile(file) {
+            fileName.textContent = file.name;
+            
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                const dataURL = e.target.result;
+                previewImage.src = dataURL;
+                previewSection.style.display = 'block';
+                
+                // Convert to PNG and extract base64
+                convertToPNGBase64(dataURL, file.type);
+            };
+            reader.readAsDataURL(file);
+        }
+
+        // Convert image to RGB JPEG base64 (JPEG has no alpha channel - always 3 channels)
+        function convertToPNGBase64(dataURL, mimeType) {
+            const img = new Image();
+            img.onload = () => {
+                uploadedImageElement = img;
+                
+                // Create canvas
+                const canvas = document.createElement('canvas');
+                canvas.width = img.width;
+                canvas.height = img.height;
+                const ctx = canvas.getContext('2d');
+                
+                // Fill with white background first (handles transparency)
+                ctx.fillStyle = 'white';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                
+                // Draw image on top
+                ctx.drawImage(img, 0, 0);
+                
+                // Convert to JPEG with high quality (JPEG = 3 channels RGB only, no alpha)
+                const jpegDataURL = canvas.toDataURL('image/jpeg', 0.98);
+                uploadedImageBase64 = jpegDataURL.split(',')[1];
+                
+                // Enable segment button
+                segmentButton.disabled = false;
+                
+                console.log(`Image converted to JPEG base64 (${canvas.width}x${canvas.height}, 3-channel RGB), ready for segmentation`);
+            };
+            img.src = dataURL;
+        }
+
+        // Segment button handler
+        segmentButton.addEventListener('click', async () => {
+            if (!uploadedImageBase64 || !cellSegmenterService) {
+                showError('Please upload an image and ensure connection is established');
+                return;
+            }
+
+            try {
+                // Show loading state
+                segmentButton.disabled = true;
+                loadingSpinner.classList.add('active');
+                resultsSection.classList.remove('active');
+                errorMessage.classList.remove('active');
+
+                const startTime = performance.now();
+
+                // Call segment_all service
+                console.log('Calling segment_all service...');
+                const result = await cellSegmenterService.segment_all(
+                    uploadedImageBase64,
+                    false,  // embedding
+                    'microsam',  // method
+                    false,  // tiling
+                    null,  // tile_shape
+                    null,  // halo
+                    100  // min_cell_size
+                );
+
+                const endTime = performance.now();
+                const duration = ((endTime - startTime) / 1000).toFixed(2);
+
+                console.log('Segmentation result:', result);
+
+                // Update stats
+                cellCount.textContent = result.polygons.length;
+                processingTime.textContent = duration + 's';
+
+                // Render visualizations
+                renderInstanceMask(result.mask, uploadedImageElement.width, uploadedImageElement.height);
+                renderPolygonOverlay(result.polygons, uploadedImageElement);
+
+                // Show results
+                resultsSection.classList.add('active');
+
+            } catch (error) {
+                console.error('Segmentation error:', error);
+                showError('Segmentation failed: ' + error.message);
+            } finally {
+                // Hide loading state
+                loadingSpinner.classList.remove('active');
+                segmentButton.disabled = false;
+            }
+        });
+
+        // Decode hypha-rpc encoded ndarray (uint64)
+        function decodeUint64Array(encodedData) {
+            console.log('Decoding mask data:', encodedData);
+            
+            // Check if this is an encoded ndarray from hypha-rpc
+            if (encodedData && encodedData._rtype === 'ndarray') {
+                const uint8Array = encodedData._rvalue;
+                const shape = encodedData._rshape;
+                const dtype = encodedData._rdtype;
+                
+                console.log(`Mask shape: ${shape}, dtype: ${dtype}, bytes: ${uint8Array.length}`);
+                
+                // For uint64, each value is 8 bytes (little-endian)
+                const numPixels = shape[0] * shape[1];
+                const mask = new Uint32Array(numPixels); // Use Uint32Array for instance IDs
+                
+                // Decode uint64 values (read 8 bytes per value, little-endian)
+                let maxValue = 0;
+                for (let i = 0; i < numPixels; i++) {
+                    const byteOffset = i * 8;
+                    // Read lower 4 bytes only (instance IDs should fit in 32 bits)
+                    mask[i] = uint8Array[byteOffset] | 
+                             (uint8Array[byteOffset + 1] << 8) | 
+                             (uint8Array[byteOffset + 2] << 16) | 
+                             (uint8Array[byteOffset + 3] << 24);
+                    
+                    // Track max value without spreading array (avoids stack overflow)
+                    if (mask[i] > maxValue) {
+                        maxValue = mask[i];
+                    }
+                }
+                
+                console.log(`Decoded ${numPixels} pixels, max value: ${maxValue}`);
+                return mask;
+            }
+            
+            // Fallback for plain array
+            return Array.isArray(encodedData) ? encodedData : encodedData.data || encodedData;
+        }
+
+        // Render instance mask with colored regions
+        function renderInstanceMask(maskData, width, height) {
+            // Decode the mask data
+            const mask = decodeUint64Array(maskData);
+            
+            // Set canvas size
+            maskCanvas.width = width;
+            maskCanvas.height = height;
+            const ctx = maskCanvas.getContext('2d');
+
+            // Create image data
+            const imageData = ctx.createImageData(width, height);
+            
+            // Generate color map for instance IDs
+            const colorMap = new Map();
+            colorMap.set(0, [0, 0, 0]); // Background is black
+            
+            // Find unique instance IDs and assign colors
+            const instanceIds = new Set();
+            for (let i = 0; i < mask.length; i++) {
+                if (mask[i] > 0) {
+                    instanceIds.add(mask[i]);
+                }
+            }
+            
+            console.log(`Found ${instanceIds.size} unique instances`);
+            
+            // Assign random colors to each instance
+            instanceIds.forEach(id => {
+                colorMap.set(id, [
+                    Math.floor(Math.random() * 200 + 55),  // R
+                    Math.floor(Math.random() * 200 + 55),  // G
+                    Math.floor(Math.random() * 200 + 55)   // B
+                ]);
+            });
+
+            // Fill image data with colors
+            for (let i = 0; i < mask.length; i++) {
+                const instanceId = mask[i];
+                const color = colorMap.get(instanceId) || [0, 0, 0];
+                const pixelIndex = i * 4;
+                imageData.data[pixelIndex] = color[0];     // R
+                imageData.data[pixelIndex + 1] = color[1]; // G
+                imageData.data[pixelIndex + 2] = color[2]; // B
+                imageData.data[pixelIndex + 3] = 255;      // A
+            }
+
+            ctx.putImageData(imageData, 0, 0);
+            console.log('Instance mask rendered successfully');
+        }
+
+        // Render polygon overlay on original image
+        function renderPolygonOverlay(polygons, image) {
+            // Set canvas size
+            overlayCanvas.width = image.width;
+            overlayCanvas.height = image.height;
+            const ctx = overlayCanvas.getContext('2d');
+
+            // Draw original image
+            ctx.drawImage(image, 0, 0);
+
+            // Draw each polygon
+            polygons.forEach(item => {
+                // Generate random color for this cell
+                const r = Math.floor(Math.random() * 200 + 55);
+                const g = Math.floor(Math.random() * 200 + 55);
+                const b = Math.floor(Math.random() * 200 + 55);
+
+                // Draw each polygon contour (outer boundary and holes)
+                item.polygons.forEach(polygon => {
+                    if (polygon.length < 3) return;
+
+                    ctx.beginPath();
+                    ctx.moveTo(polygon[0][0], polygon[0][1]);
+                    
+                    for (let i = 1; i < polygon.length; i++) {
+                        ctx.lineTo(polygon[i][0], polygon[i][1]);
+                    }
+                    ctx.closePath();
+
+                    // Fill with semi-transparent color
+                    ctx.fillStyle = `rgba(${r}, ${g}, ${b}, 0.3)`;
+                    ctx.fill();
+
+                    // Stroke with solid color
+                    ctx.strokeStyle = `rgb(${r}, ${g}, ${b})`;
+                    ctx.lineWidth = 2;
+                    ctx.stroke();
+                });
+            });
+        }
+
+        // Show error message
+        function showError(message) {
+            errorMessage.textContent = message;
+            errorMessage.classList.add('active');
+            setTimeout(() => {
+                errorMessage.classList.remove('active');
+            }, 5000);
+        }
+
+        // Initialize on page load - wait for DOM to be ready
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', init);
+        } else {
+            // DOM is already loaded, init immediately
+            init();
+        }
+    </script>
+</body>
+</html>
+
