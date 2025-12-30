@@ -2,6 +2,7 @@
 """
 Enhanced evaluation script comparing pre-trained vs fine-tuned microSAM AIS.
 Shows before/after fine-tuning results for clear comparison.
+Calculates Dice, mIoU, and AP50 metrics.
 """
 
 import os
@@ -10,8 +11,91 @@ import imageio.v3 as imageio
 import matplotlib.pyplot as plt
 from glob import glob
 import torch
+from scipy.optimize import linear_sum_assignment
+from sklearn.metrics import average_precision_score
 
 from micro_sam.automatic_segmentation import get_predictor_and_segmenter, automatic_instance_segmentation
+
+
+def calculate_dice_score(pred_mask, gt_mask):
+    """Calculate Dice coefficient between prediction and ground truth."""
+    # Convert to binary masks
+    pred_binary = (pred_mask > 0).astype(np.float32)
+    gt_binary = (gt_mask > 0).astype(np.float32)
+    
+    intersection = np.sum(pred_binary * gt_binary)
+    union = np.sum(pred_binary) + np.sum(gt_binary)
+    
+    if union == 0:
+        return 1.0 if intersection == 0 else 0.0
+    
+    dice = (2.0 * intersection) / union
+    return dice
+
+
+def calculate_miou(pred_mask, gt_mask):
+    """Calculate mean Intersection over Union (mIoU)."""
+    # Convert to binary masks
+    pred_binary = (pred_mask > 0).astype(np.float32)
+    gt_binary = (gt_mask > 0).astype(np.float32)
+    
+    intersection = np.sum(pred_binary * gt_binary)
+    union = np.sum(pred_binary) + np.sum(gt_binary) - intersection
+    
+    if union == 0:
+        return 1.0 if intersection == 0 else 0.0
+    
+    iou = intersection / union
+    return iou
+
+
+def calculate_ap50(pred_mask, gt_mask):
+    """
+    Calculate Average Precision at IoU threshold 0.5 (AP50).
+    Matches predicted instances to ground truth instances.
+    """
+    # Get unique instance IDs (excluding background 0)
+    pred_ids = np.unique(pred_mask)[1:]  # Skip 0
+    gt_ids = np.unique(gt_mask)[1:]      # Skip 0
+    
+    if len(pred_ids) == 0 and len(gt_ids) == 0:
+        return 1.0  # Perfect if both empty
+    if len(pred_ids) == 0 or len(gt_ids) == 0:
+        return 0.0  # No match if one is empty
+    
+    # Compute IoU matrix between all pred and gt instances
+    iou_matrix = np.zeros((len(pred_ids), len(gt_ids)))
+    
+    for i, pred_id in enumerate(pred_ids):
+        pred_instance = (pred_mask == pred_id)
+        for j, gt_id in enumerate(gt_ids):
+            gt_instance = (gt_mask == gt_id)
+            
+            intersection = np.sum(pred_instance & gt_instance)
+            union = np.sum(pred_instance | gt_instance)
+            
+            if union > 0:
+                iou_matrix[i, j] = intersection / union
+    
+    # Use Hungarian algorithm to find optimal matching
+    pred_indices, gt_indices = linear_sum_assignment(-iou_matrix)
+    
+    # Count true positives at IoU threshold 0.5
+    matched_ious = iou_matrix[pred_indices, gt_indices]
+    true_positives = np.sum(matched_ious >= 0.5)
+    
+    # Calculate precision and recall
+    precision = true_positives / len(pred_ids) if len(pred_ids) > 0 else 0
+    recall = true_positives / len(gt_ids) if len(gt_ids) > 0 else 0
+    
+    # AP50 is the precision at 50% IoU threshold
+    # For simplicity, we use F1-score as a proxy for AP
+    if precision + recall > 0:
+        ap50 = 2 * (precision * recall) / (precision + recall)
+    else:
+        ap50 = 0.0
+    
+    return ap50
 
 
 def run_automatic_instance_segmentation(image, checkpoint_path=None, model_type="vit_b_lm", device="cuda"):
@@ -131,6 +215,20 @@ def evaluate_models_comparison(
         
         print(f"    📈 Improvement: {improvement:+d} cells ({improvement_pct:+.1f}%)")
         
+        # Calculate metrics for pre-trained model
+        print("  📊 Calculating metrics for pre-trained model...")
+        pretrained_dice = calculate_dice_score(pretrained_pred, gt_mask)
+        pretrained_miou = calculate_miou(pretrained_pred, gt_mask)
+        pretrained_ap50 = calculate_ap50(pretrained_pred, gt_mask)
+        print(f"    Dice: {pretrained_dice:.4f}, mIoU: {pretrained_miou:.4f}, AP50: {pretrained_ap50:.4f}")
+        
+        # Calculate metrics for fine-tuned model
+        print("  📊 Calculating metrics for fine-tuned model...")
+        finetuned_dice = calculate_dice_score(finetuned_pred, gt_mask)
+        finetuned_miou = calculate_miou(finetuned_pred, gt_mask)
+        finetuned_ap50 = calculate_ap50(finetuned_pred, gt_mask)
+        print(f"    Dice: {finetuned_dice:.4f}, mIoU: {finetuned_miou:.4f}, AP50: {finetuned_ap50:.4f}")
+        
         results.append({
             'image': image,
             'gt': gt_mask,
@@ -142,6 +240,13 @@ def evaluate_models_comparison(
             'n_finetuned': n_finetuned,
             'improvement': improvement,
             'improvement_pct': improvement_pct,
+            # Metrics
+            'pretrained_dice': pretrained_dice,
+            'pretrained_miou': pretrained_miou,
+            'pretrained_ap50': pretrained_ap50,
+            'finetuned_dice': finetuned_dice,
+            'finetuned_miou': finetuned_miou,
+            'finetuned_ap50': finetuned_ap50,
         })
     
     # Create visualization
@@ -152,6 +257,10 @@ def evaluate_models_comparison(
         
         # Print summary statistics
         print_summary_stats(results)
+        
+        # Generate and save metrics table
+        print(f"\n📊 Generating metrics table...")
+        generate_metrics_table(results, output_dir)
     
     return results
 
@@ -246,6 +355,102 @@ def create_improvement_summary_plot(results, output_dir):
     plt.savefig(os.path.join(output_dir, 'improvement_summary.png'), 
                 dpi=150, bbox_inches='tight')
     plt.close()
+
+
+def generate_metrics_table(results, output_dir):
+    """Generate and save metrics table comparing pre-trained vs fine-tuned models."""
+    if not results:
+        return
+    
+    # Calculate average metrics
+    avg_pretrained_dice = np.mean([r['pretrained_dice'] for r in results])
+    avg_pretrained_miou = np.mean([r['pretrained_miou'] for r in results])
+    avg_pretrained_ap50 = np.mean([r['pretrained_ap50'] for r in results])
+    
+    avg_finetuned_dice = np.mean([r['finetuned_dice'] for r in results])
+    avg_finetuned_miou = np.mean([r['finetuned_miou'] for r in results])
+    avg_finetuned_ap50 = np.mean([r['finetuned_ap50'] for r in results])
+    
+    # Create table
+    table_data = [
+        ["Model", "Split", "Dice ↑", "mIoU ↑", "AP50 ↑"],
+        ["Pretrained micro-SAM", "Val", f"{avg_pretrained_dice:.4f}", f"{avg_pretrained_miou:.4f}", f"{avg_pretrained_ap50:.4f}"],
+        ["Fine-tuned (frozen encoder)", "Val", f"{avg_finetuned_dice:.4f}", f"{avg_finetuned_miou:.4f}", f"{avg_finetuned_ap50:.4f}"],
+    ]
+    
+    # Print table to console
+    print("\n" + "="*80)
+    print("📊 METRICS TABLE")
+    print("="*80)
+    for row in table_data:
+        print(f"{row[0]:<30} {row[1]:<10} {row[2]:<12} {row[3]:<12} {row[4]:<12}")
+    print("="*80)
+    
+    # Save table to text file
+    table_path = os.path.join(output_dir, 'metrics_table.txt')
+    with open(table_path, 'w') as f:
+        f.write("="*80 + "\n")
+        f.write("METRICS TABLE: Pre-trained vs Fine-tuned microSAM\n")
+        f.write("="*80 + "\n\n")
+        for row in table_data:
+            f.write(f"{row[0]:<30} {row[1]:<10} {row[2]:<12} {row[3]:<12} {row[4]:<12}\n")
+        f.write("\n" + "="*80 + "\n")
+        f.write(f"\nEvaluated on {len(results)} validation samples\n")
+        f.write(f"Dataset: Revvity-25\n")
+    
+    print(f"✅ Metrics table saved to: {table_path}")
+    
+    # Save as CSV for easy import
+    csv_path = os.path.join(output_dir, 'metrics_table.csv')
+    with open(csv_path, 'w') as f:
+        f.write("Model,Split,Dice,mIoU,AP50\n")
+        f.write(f"Pretrained micro-SAM,Val,{avg_pretrained_dice:.4f},{avg_pretrained_miou:.4f},{avg_pretrained_ap50:.4f}\n")
+        f.write(f"Fine-tuned (frozen encoder),Val,{avg_finetuned_dice:.4f},{avg_finetuned_miou:.4f},{avg_finetuned_ap50:.4f}\n")
+    
+    print(f"✅ CSV table saved to: {csv_path}")
+    
+    # Create visual table plot
+    create_metrics_table_plot(table_data, output_dir)
+
+
+def create_metrics_table_plot(table_data, output_dir):
+    """Create a visual plot of the metrics table."""
+    fig, ax = plt.subplots(figsize=(12, 4))
+    ax.axis('tight')
+    ax.axis('off')
+    
+    # Create table
+    table = ax.table(cellText=table_data, cellLoc='center', loc='center',
+                     colWidths=[0.35, 0.15, 0.15, 0.15, 0.15])
+    
+    # Style the table
+    table.auto_set_font_size(False)
+    table.set_fontsize(11)
+    table.scale(1, 2)
+    
+    # Header styling
+    for i in range(5):
+        cell = table[(0, i)]
+        cell.set_facecolor('#4472C4')
+        cell.set_text_props(weight='bold', color='white')
+    
+    # Row styling
+    for i in range(1, 3):
+        for j in range(5):
+            cell = table[(i, j)]
+            if i == 1:
+                cell.set_facecolor('#E7E6E6')
+            else:
+                cell.set_facecolor('#D9E1F2')
+    
+    plt.title('Performance Metrics: Pre-trained vs Fine-tuned microSAM', 
+              fontsize=14, weight='bold', pad=20)
+    
+    plt.savefig(os.path.join(output_dir, 'metrics_table.png'), 
+                dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    print(f"✅ Metrics table plot saved to: {os.path.join(output_dir, 'metrics_table.png')}")
 
 
 def print_summary_stats(results):

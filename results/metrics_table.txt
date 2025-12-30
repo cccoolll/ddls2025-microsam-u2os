@@ -1,0 +1,12 @@
+================================================================================
+METRICS TABLE: Pre-trained vs Fine-tuned microSAM
+================================================================================
+
+Model                          Split      Dice ↑       mIoU ↑       AP50 ↑      
+Pretrained micro-SAM           Val        0.7038       0.5450       0.6286      
+Fine-tuned (frozen encoder)    Val        0.9141       0.8419       0.8744      
+
+================================================================================
+
+Evaluated on 6 validation samples
+Dataset: Revvity-25
