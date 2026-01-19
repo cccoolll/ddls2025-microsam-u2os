@@ -70,5 +70,5 @@ result = await service.segment_all(image_base64, method="microsam")
 ## References
 
 - [micro-sam](https://github.com/computational-cell-analytics/micro-sam)
-- [BioEngine](https://bioengine.ai/)
-- [Revvity-25 Dataset](https://bbbc.broadinstitute.org/)
+- [BioEngine](https://github.com/bioimage-io/bioengine)
+- [Revvity-25 Dataset](https://huggingface.co/datasets/YaroslavPrytula/Revvity-25/)
