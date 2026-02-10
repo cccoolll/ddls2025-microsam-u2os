@@ -704,9 +704,6 @@ class CellSegmenter:
             description="Minimum cell size in pixels (area) to filter out small objects. Passed as 'min_size' to the segmenter's generate method. Default is 100.",
         ),
     ) -> Any:
-        # Import skimage for polygon extraction (used by both methods)
-        from skimage.measure import find_contours, regionprops, approximate_polygon
-        
         # Validate method parameter
         if method not in ["microsam", "cellpose"]:
             raise ValueError(f"Invalid method: {method}. Must be 'microsam' or 'cellpose'")
@@ -833,60 +830,9 @@ class CellSegmenter:
                 else:
                     instances = np.array(instances)
             
-            # Extract polygons for each instance object using regionprops
-            # This directly processes the instance mask where each object has a unique ID
-            props = regionprops(instances)
-            
-            # Create list to store polygons for each object
-            polygons_list = []
-            
-            # Extract polygon contours for each instance object
-            for prop in props:
-                instance_id = prop.label
-                
-                # Get the mask for this specific instance only
-                instance_mask = (instances == instance_id).astype(np.uint8)
-                
-
-                # Find contours for this instance with high connectivity for detailed boundaries
-                # fully_connected='high' ensures we capture all boundary pixels
-                contours = find_contours(instance_mask, level=0.5, fully_connected='high')
-                
-                # Convert contours to polygon format with minimal simplification
-                # Each contour is a list of (row, col) coordinates
-                instance_polygons = []
-                for contour in contours:
-                    # Use very low tolerance (0.3 pixels) to preserve fine details
-                    # This removes only truly redundant points while keeping shape accuracy
-                    simplified_contour = approximate_polygon(contour, tolerance=0.3)
-                    
-                    # Ensure we have enough points for a valid polygon
-                    if len(simplified_contour) < 3:
-                        # If simplification removed too many points, use original contour
-                        simplified_contour = contour
-                    
-                    # Convert from (row, col) to (x, y) format
-                    # contour shape: (N, 2) where each row is (row, col)
-                    # Convert to (x, y) by swapping: (col, row) -> (x, y)
-                    polygon = [[float(point[1]), float(point[0])] for point in simplified_contour]
-                    instance_polygons.append(polygon)
-                
-                # Get bounding box from regionprops
-                bbox = prop.bbox  # (min_row, min_col, max_row, max_col)
-                
-                # Store polygon data for this instance
-                polygons_list.append({
-                    "id": int(instance_id),
-                    "polygons": instance_polygons,  # List of polygons (outer contour + holes if any)
-                    "bbox": [int(bbox[1]), int(bbox[0]), int(bbox[3]), int(bbox[2])]  # [x_min, y_min, x_max, y_max]
-                })
-            
-            # Return both mask and polygons
-            # Mask is returned as numpy array to preserve exact uint32 instance IDs (critical for medical/industrial use)
-            return {
-                "polygons": polygons_list,
-                "mask": instances  # Numpy array with exact instance segmentation mask (preserves uint32 dtype and all instance IDs)
-            }
+            # Return only the segmentation mask (features)
+            # Mask is returned as numpy array to preserve exact instance IDs
+            return instances
 
 if __name__ == "__main__":
     import asyncio
