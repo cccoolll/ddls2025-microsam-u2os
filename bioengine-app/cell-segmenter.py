@@ -673,6 +673,10 @@ class CellSegmenter:
             raise ValueError(f"Failed to encode segmentation to PNG: {str(e)}")
     
     @schema_method
+    async def ping(self) -> str:
+        return "pong"
+        
+    @schema_method
     async def segment_all(
         self,
         image_or_embedding: Any = Field(
