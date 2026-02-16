@@ -681,7 +681,7 @@ class CellSegmenter:
         self,
         image_or_embedding: Any = Field(
             ...,
-            description="Base64-encoded PNG string (required for images). Numpy arrays are NOT accepted for images.",
+            description="Base64-encoded PNG string or numpy array (C, H, W) when embedding=False. 1D array when embedding=True.",
         ),
         embedding: bool = Field(
             False,
@@ -720,26 +720,22 @@ class CellSegmenter:
             if len(image_or_embedding.shape) != 1:
                 raise ValueError(f"Expected 1D embedding array, got shape {image_or_embedding.shape}")
         else:
-            # STRICT: For images, ONLY accept base64-encoded PNG string
-            # NO numpy arrays, NO fallback, NO exceptions
-            if not isinstance(image_or_embedding, str):
-                raise ValueError(
-                    f"ONLY base64-encoded PNG strings are accepted for images. "
-                    f"Received {type(image_or_embedding).__name__}. "
-                    f"Numpy arrays and other formats are NOT supported. "
-                    f"Please encode your image as PNG and encode as base64 string."
-                )
+            # For images, accept base64-encoded PNG string or numpy array
+            if isinstance(image_or_embedding, str):
+                # Additional check: ensure it's not an empty string
+                if len(image_or_embedding.strip()) == 0:
+                    raise ValueError("Empty string provided. Must be a valid base64-encoded PNG string.")
+                
+                # Decode PNG image from base64
+                image_array = self._decode_image(image_or_embedding)
+            else:
+                if not isinstance(image_or_embedding, np.ndarray):
+                    image_or_embedding = np.array(image_or_embedding)
+                image_array = image_or_embedding
             
-            # Additional check: ensure it's not an empty string
-            if len(image_or_embedding.strip()) == 0:
-                raise ValueError("Empty string provided. Must be a valid base64-encoded PNG string.")
-            
-            # Decode PNG image from base64
-            image_array = self._decode_image(image_or_embedding)
-            
-            # Validate decoded image format
+            # Validate image format
             if not self._validate_image_format(image_array):
-                raise ValueError(f"Invalid decoded image format. Expected (C, H, W) where C in [1, 3], got {image_array.shape}")
+                raise ValueError(f"Invalid image format. Expected (C, H, W) where C in [1, 3], got {image_array.shape}")
         
         # Set default tile_shape and halo if tiling is enabled (only for microSAM)
         if tiling and method == "microsam":
@@ -848,4 +844,3 @@ if __name__ == "__main__":
         print(response)
 
     asyncio.run(test())
-
