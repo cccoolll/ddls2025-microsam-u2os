@@ -22,7 +22,7 @@ async def deploy_cellsegmenter():
         "token": token,
     })
     # Songtao's workspace
-    workspace = "agent-lens"
+    workspace = "reef-imaging"
     # Get the worker service
     worker = await server.get_service(f"{workspace}/cell_segmenter:bioengine-worker")
     
@@ -69,7 +69,7 @@ async def deploy_cellsegmenter():
     print("Connecting to deployed CellSegmenter application...")
     
     try:
-        # Find the cell-segmenter application (it might have a prefix like 'agent-lens/')
+        # Find the cell-segmenter application (it might have a prefix like 'reef-imaging/')
         cellsegmenter_app_name = None
         for app_name in applications.keys():
             if app_name.endswith('/cell-segmenter') or app_name == 'cell-segmenter':
