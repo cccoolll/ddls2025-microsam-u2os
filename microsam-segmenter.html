@@ -526,8 +526,8 @@
                 });
                 
                 console.log('[init] Getting cell-segmenter service...');
-                // Get cell-segmenter service from agent-lens workspace
-                cellSegmenterService = await hyphaClient.getService('agent-lens/cell-segmenter');
+                // Get cell-segmenter service from reef-imaging workspace
+                cellSegmenterService = await hyphaClient.getService('reef-imaging/cell-segmenter');
                 
                 // Hide login section and update status
                 loginSection.style.display = 'none';

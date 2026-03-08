@@ -56,14 +56,14 @@ python train_ais_optimized.py
 
 ## BioEngine Service
 
-- **Service**: `agent-lens/cell-segmenter` at `https://hypha.aicell.io`
+- **Service**: `reef-imaging/cell-segmenter` at `https://hypha.aicell.io`
 - **Methods**: microSAM (fine-tuned) or Cellpose
 
 ```python
 from hypha_rpc import connect_to_server
 
 server = await connect_to_server({"server_url": "https://hypha.aicell.io"})
-service = await server.get_service("agent-lens/cell-segmenter")
+service = await server.get_service("reef-imaging/cell-segmenter")
 result = await service.segment_all(image_base64, method="microsam")
 ```
 
