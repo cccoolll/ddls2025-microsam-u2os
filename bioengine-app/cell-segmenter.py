@@ -788,16 +788,20 @@ class CellSegmenter:
             # # Apply contrast stretching normalization (2nd-98th percentile)
             
             # Run segmentation with selected method using original image
+            # Use asyncio.to_thread() to avoid blocking the event loop (which would
+            # prevent Ray Serve health checks from responding, causing the replica
+            # to be marked unhealthy and killed mid-request).
+            import asyncio
             if method == "cellpose":
                 # Load Cellpose model and run segmentation
-                instances = self._segment_with_cellpose(image_2d)
+                instances = await asyncio.to_thread(self._segment_with_cellpose, image_2d)
             elif method == "microsam":
                 # Import microSAM only when needed
                 from micro_sam.automatic_segmentation import automatic_instance_segmentation
-                
-                # Load microSAM model with appropriate tiling state
-                self._load_model(is_tiled=tiling)
-                
+
+                # Load microSAM model with appropriate tiling state (blocking)
+                await asyncio.to_thread(self._load_model, is_tiled=tiling)
+
                 # Prepare kwargs for microSAM segmentation
                 kwargs = {
                     "predictor": self.predictor,
@@ -807,14 +811,14 @@ class CellSegmenter:
                     "verbose": False,  # Disable console output for speed
                     "min_size": min_cell_size,  # Pass min_size to segmenter.generate() via generate_kwargs
                 }
-                
+
                 # Add tiling parameters if tiling is enabled
                 if tiling:
                     kwargs["tile_shape"] = tile_shape
                     kwargs["halo"] = halo
-                
+
                 # Run segmentation - returns instance segmentation with unique IDs per object
-                instances = automatic_instance_segmentation(**kwargs)
+                instances = await asyncio.to_thread(automatic_instance_segmentation, **kwargs)
             
             # Convert prediction to numpy array if it's not already
             if not isinstance(instances, np.ndarray):
