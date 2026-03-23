@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cell Segmenter - Pure Hypha</title>
+    <script src="https://cdn.jsdelivr.net/npm/hypha-rpc@0.20.97/dist/hypha-rpc-websocket.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #f5f5f5;
+            padding: 20px;
+            line-height: 1.6;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+            margin-bottom: 10px;
+        }
+        .subtitle {
+            color: #666;
+            margin-bottom: 30px;
+        }
+        .controls {
+            display: flex;
+            gap: 20px;
+            flex-wrap: wrap;
+            margin-bottom: 20px;
+            padding: 20px;
+            background: #f8f9fa;
+            border-radius: 8px;
+        }
+        .control-group {
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }
+        label {
+            font-weight: 600;
+            color: #555;
+            font-size: 14px;
+        }
+        select, input[type="file"] {
+            padding: 8px 12px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        button {
+            padding: 10px 20px;
+            background: #007bff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 600;
+        }
+        button:hover {
+            background: #0056b3;
+        }
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        .status {
+            padding: 10px 15px;
+            border-radius: 4px;
+            margin-bottom: 20px;
+            display: none;
+        }
+        .status.success {
+            background: #d4edda;
+            color: #155724;
+            display: block;
+        }
+        .status.error {
+            background: #f8d7da;
+            color: #721c24;
+            display: block;
+        }
+        .status.info {
+            background: #d1ecf1;
+            color: #0c5460;
+            display: block;
+        }
+        .images {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin-top: 20px;
+        }
+        .image-box {
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            padding: 15px;
+            background: white;
+        }
+        .image-box h3 {
+            margin-bottom: 10px;
+            color: #333;
+        }
+        .image-box img {
+            width: 100%;
+            height: auto;
+            border-radius: 4px;
+            display: block;
+        }
+        .image-box canvas {
+            width: 100%;
+            height: auto;
+            border-radius: 4px;
+            display: block;
+        }
+        .loading {
+            display: none;
+            text-align: center;
+            padding: 40px;
+        }
+        .loading.active {
+            display: block;
+        }
+        .spinner {
+            width: 40px;
+            height: 40px;
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #007bff;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 15px;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔬 Cell Segmenter</h1>
+        <p class="subtitle">Pure Hypha Service - No BioEngine Required</p>
+
+        <div id="status" class="status"></div>
+
+        <div class="controls">
+            <div class="control-group">
+                <label for="imageInput">Upload Image</label>
+                <input type="file" id="imageInput" accept="image/*">
+            </div>
+            <div class="control-group">
+                <label for="methodSelect">Segmentation Method</label>
+                <select id="methodSelect">
+                    <option value="cellpose">Cellpose (Fast)</option>
+                    <option value="microsam">microSAM (Accurate)</option>
+                </select>
+            </div>
+            <div class="control-group" style="justify-content: flex-end;">
+                <button id="segmentBtn" disabled>Run Segmentation</button>
+            </div>
+        </div>
+
+        <div class="loading" id="loading">
+            <div class="spinner"></div>
+            <p>Running segmentation...</p>
+        </div>
+
+        <div class="images" id="images" style="display: none;">
+            <div class="image-box">
+                <h3>Original Image</h3>
+                <img id="originalImage" alt="Original">
+            </div>
+            <div class="image-box">
+                <h3>Segmentation Result</h3>
+                <canvas id="resultCanvas"></canvas>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Configuration
+        const SERVER_URL = 'https://hypha.aicell.io';
+        const WORKSPACE = 'reef-imaging';
+        const SERVICE_ID = 'cell-segmenter-hypha';
+
+        // State
+        let server = null;
+        let service = null;
+        let currentImageBase64 = null;
+
+        // DOM elements
+        const statusEl = document.getElementById('status');
+        const imageInput = document.getElementById('imageInput');
+        const methodSelect = document.getElementById('methodSelect');
+        const segmentBtn = document.getElementById('segmentBtn');
+        const loadingEl = document.getElementById('loading');
+        const imagesEl = document.getElementById('images');
+        const originalImage = document.getElementById('originalImage');
+        const resultCanvas = document.getElementById('resultCanvas');
+
+        function showStatus(message, type = 'info') {
+            statusEl.className = `status ${type}`;
+            statusEl.textContent = message;
+        }
+
+        function clearStatus() {
+            statusEl.className = 'status';
+            statusEl.style.display = 'none';
+        }
+
+        // Connect to Hypha service
+        async function connectService() {
+            try {
+                showStatus('Connecting to Hypha server...', 'info');
+                
+                server = await hyphaWebsocketClient.connectToServer({
+                    server_url: SERVER_URL
+                });
+
+                service = await server.getService(`${WORKSPACE}/${SERVICE_ID}`);
+                
+                // Test connection
+                const pong = await service.ping();
+                if (pong === 'pong') {
+                    showStatus('✅ Connected to segmentation service', 'success');
+                    setTimeout(clearStatus, 2000);
+                }
+            } catch (error) {
+                showStatus(`❌ Connection failed: ${error.message}`, 'error');
+                console.error(error);
+            }
+        }
+
+        // Handle image upload
+        imageInput.addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            const reader = new FileReader();
+            reader.onload = (event) => {
+                currentImageBase64 = event.target.result.split(',')[1];
+                originalImage.src = event.target.result;
+                imagesEl.style.display = 'grid';
+                segmentBtn.disabled = false;
+                clearStatus();
+            };
+            reader.readAsDataURL(file);
+        });
+
+        // Run segmentation
+        segmentBtn.addEventListener('click', async () => {
+            if (!currentImageBase64 || !service) {
+                showStatus('Please upload an image first', 'error');
+                return;
+            }
+
+            const method = methodSelect.value;
+            
+            loadingEl.classList.add('active');
+            segmentBtn.disabled = true;
+            showStatus(`Running ${method} segmentation...`, 'info');
+
+            try {
+                const result = await service.segment_all({
+                    image: currentImageBase64,
+                    method: method,
+                    min_cell_size: 100
+                });
+
+                if (result.success) {
+                    // Display result
+                    const img = new Image();
+                    img.onload = () => {
+                        resultCanvas.width = img.width;
+                        resultCanvas.height = img.height;
+                        const ctx = resultCanvas.getContext('2d');
+                        ctx.drawImage(img, 0, 0);
+                    };
+                    img.src = 'data:image/png;base64,' + result.mask;
+                    
+                    showStatus(`✅ ${result.message}`, 'success');
+                } else {
+                    showStatus(`❌ ${result.message}`, 'error');
+                }
+            } catch (error) {
+                showStatus(`❌ Error: ${error.message}`, 'error');
+                console.error(error);
+            } finally {
+                loadingEl.classList.remove('active');
+                segmentBtn.disabled = false;
+            }
+        });
+
+        // Initialize on page load
+        window.addEventListener('load', connectService);
+    </script>
+</body>
+</html>
